@@ -1,0 +1,587 @@
+name: ACCM availability-qualified patch resolution R4
+on:
+  workflow_dispatch:
+    inputs:
+      reviewed_merge_sha:
+        description: Independently reviewed protected merge commit
+        required: true
+        type: string
+permissions: {}
+concurrency:
+  group: accm-public-source-qualification
+  cancel-in-progress: false
+jobs:
+  resolve:
+    if: github.repository == 'Zerefzeolite/axium-accm-integration' && github.repository_id == '1472823260' && github.actor_id == '9297681' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && github.run_number == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Resolve fixed public dependency versions without compiling
+        shell: bash
+        env:
+          REVIEWED_MERGE_SHA: ${{ inputs.reviewed_merge_sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(id -u)" -ne 0
+          test "$(uname -m)" = x86_64
+          test "$GITHUB_REF_PROTECTED" = true
+          test "$GITHUB_WORKFLOW_REF" = 'Zerefzeolite/axium-accm-integration/.github/workflows/patch-resolution-r4.yml@refs/heads/main'
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          [[ "$REVIEWED_MERGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_SHA" = "$REVIEWED_MERGE_SHA"
+          root="$(mktemp -d)"
+          tag="accm-patch-resolver:$GITHUB_RUN_ID"
+          release_name="accm-resolve-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test_name="accm-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          cleanup() {
+            docker rm -f "$release_name" "$test_name" >/dev/null 2>&1 || true
+            docker image rm "$tag" >/dev/null 2>&1 || true
+            rm -rf -- "$root"
+          }
+          trap cleanup EXIT
+          mkdir -m 700 "$root/home" "$root/gnupg" "$root/tmp" "$root/context" "$root/tool" "$root/vendor" "$root/src" "$root/work" "$root/review" "$root/registry"
+          cd "$root"
+          clean() { env -i PATH=/usr/bin:/bin HOME="$root/home" TMPDIR="$root/tmp" LC_ALL=C TZ=UTC "$@"; }
+          fetch() {
+            clean /usr/bin/curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 20 --max-time 600 --output "$2" "$1"
+          }
+          fetch https://static.rust-lang.org/rust-key.gpg.ascii rust-key.asc
+          fetch https://static.rust-lang.org/dist/channel-rust-1.98.0.toml manifest.toml
+          fetch https://static.rust-lang.org/dist/channel-rust-1.98.0.toml.asc manifest.asc
+          clean /usr/bin/gpg --homedir "$root/gnupg" --batch --import rust-key.asc
+          clean /usr/bin/gpg --homedir "$root/gnupg" --batch --with-colons --list-keys > key.txt
+          clean /usr/bin/gpg --homedir "$root/gnupg" --batch --status-fd 1 --verify manifest.asc manifest.toml > signature.txt
+          clean /usr/bin/python3 - <<'PY'
+          import pathlib, re, tomllib, urllib.parse
+          p = pathlib.Path
+          expected = "108F66205EAEB0AAA8DD5E1C85AB96E6FA1BE5FE"
+          rows = [x.split(":") for x in p("key.txt").read_text().splitlines()]
+          primary = [rows[i+1][9] for i, x in enumerate(rows) if x[0] == "pub" and rows[i+1][0] == "fpr"]
+          assert primary == [expected], "Unexpected signing key"
+          sigs = [x.split() for x in p("signature.txt").read_text().splitlines() if x.startswith("[GNUPG:] VALIDSIG ")]
+          assert len(sigs) == 1 and sigs[0][-1] == expected, "Wrong signer"
+          assert sigs[0][9] in {"8", "9", "10", "11"}, "Weak signature hash"
+          m = tomllib.loads(p("manifest.toml").read_text())
+          assert m["pkg"]["rust"]["version"].split()[0] == "1.98.0"
+          a = m["pkg"]["rust"]["target"]["x86_64-unknown-linux-gnu"]
+          assert a["available"] is True
+          u = urllib.parse.urlsplit(a["xz_url"])
+          assert u.scheme == "https" and u.netloc == "static.rust-lang.org"
+          assert re.fullmatch(r"/dist/(?:[0-9]{4}-[0-9]{2}-[0-9]{2}/)?rust-1\.98\.0-x86_64-unknown-linux-gnu\.tar\.xz", u.path)
+          assert not u.query and not u.fragment
+          assert re.fullmatch(r"[0-9a-f]{64}", a["xz_hash"])
+          p("archive-url.txt").write_text(a["xz_url"])
+          p("archive.sha256").write_text(a["xz_hash"] + "  rust.tar.xz\n")
+          PY
+          fetch "$(cat archive-url.txt)" rust.tar.xz
+          clean /usr/bin/sha256sum -c archive.sha256
+          # The signed manifest cryptographically binds the standalone archive.
+          clean /usr/bin/tar -xJf rust.tar.xz
+          test -f rust-1.98.0-x86_64-unknown-linux-gnu/install.sh
+          image='docker.io/library/ubuntu@sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe19e4081cb93a90bf56819d6a'
+          docker pull --platform linux/amd64 "$image"
+          test "$(docker image inspect "$image" --format '{{.Id}}')" = sha256:2b147973fd863c93ced60f325461fe0e262b91317b008e6a2d961f13e81af0e4
+          # Public CA bundle for HTTPS bootstrap; apt still authenticates signed
+          # Ubuntu metadata and verifies all archive hashes. No host home/context.
+          install -m 0644 /etc/ssl/certs/ca-certificates.crt context/bootstrap-ca.crt
+          cat > context/Dockerfile <<'DOCKERFILE'
+          FROM docker.io/library/ubuntu@sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe19e4081cb93a90bf56819d6a
+          COPY --chmod=0644 bootstrap-ca.crt /opt/bootstrap-ca.crt
+          RUN set -eux; \
+              test "$(stat -c %a /opt/bootstrap-ca.crt)" = 644; \
+              runuser -u _apt -- test -r /opt/bootstrap-ca.crt; \
+              runuser -u _apt -- grep -q '^-----BEGIN CERTIFICATE-----$' /opt/bootstrap-ca.crt; \
+              mkdir -p /opt/accm-inventory; \
+              rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* /etc/apt/apt.conf.d/docker-clean; \
+              printf '%s\n' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261125T000000Z/ noble main universe' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261125T000000Z/ noble-updates main universe' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261125T000000Z/ noble-security main universe' > /etc/apt/sources.list; \
+              apt-get -o Acquire::https::CaInfo=/opt/bootstrap-ca.crt -o APT::Update::Error-Mode=any update; \
+              sha256sum /var/lib/apt/lists/*InRelease | LC_ALL=C sort > /opt/accm-inventory/apt-release.sha256; \
+              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::https::CaInfo=/opt/bootstrap-ca.crt -y --no-install-recommends --download-only install build-essential pkg-config libssl-dev libsqlite3-dev ca-certificates python3 git perl; \
+              (cd /var/cache/apt/archives && sha256sum *.deb | LC_ALL=C sort) > /opt/accm-inventory/deb.sha256; \
+              DEBIAN_FRONTEND=noninteractive apt-get -y --no-install-recommends --no-download install build-essential pkg-config libssl-dev libsqlite3-dev ca-certificates python3 git perl; \
+              dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n' | LC_ALL=C sort > /opt/accm-inventory/packages.tsv; \
+              sha256sum /usr/bin/gcc /usr/bin/g++ /usr/bin/ld /usr/bin/ar /usr/bin/pkg-config /usr/bin/python3 > /opt/accm-inventory/tools.sha256; \
+              chmod -R a+rX /opt/accm-inventory; \
+              rm -f /opt/bootstrap-ca.crt; apt-get clean; rm -rf /var/lib/apt/lists/*
+          DOCKERFILE
+          # Package installation happens only in an ephemeral image build,
+          # before any Rust source/vendor inputs are mounted.
+          docker build --platform linux/amd64 --no-cache --pull=false --tag "$tag" "$root/context"
+          builder="$(docker image inspect "$tag" --format '{{.Id}}')"
+          test "$(docker image inspect "$tag" --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
+          echo "BUILDER_IMAGE_ID=$builder"
+          uid="$(id -u)"
+          gid="$(id -g)"
+          hostnet="$(readlink /proc/self/ns/net)"
+          common=(--rm --pull never --platform linux/amd64 --read-only --cap-drop ALL --security-opt no-new-privileges:true --user "$uid:$gid" --pids-limit 512 --memory 8g --cpus 2 --tmpfs "/tmp:rw,nosuid,nodev,size=512m,mode=1777" --env LC_ALL=C --env TZ=UTC)
+          offline=(--network none --env "EXPECTED_UID=$uid" --env "HOST_NETNS=$hostnet")
+          # Same boundary as successful container preflight; install verified
+          # Rust into a disposable directory, then mount it read-only.
+          docker run "${common[@]}" "${offline[@]}" \
+            --mount "type=bind,source=$root/rust-1.98.0-x86_64-unknown-linux-gnu,target=/input,readonly" \
+            --mount "type=bind,source=$root/tool,target=/toolchain" \
+            --env HOME=/tmp --workdir /tmp --entrypoint /bin/bash "$builder" --noprofile --norc -euc '
+              test "$(id -u)" = "$EXPECTED_UID"
+              test "$(readlink /proc/self/ns/net)" != "$HOST_NETNS"
+              test "$(ls -1 /sys/class/net)" = lo
+              grep -Eq "^CapEff:[[:space:]]+0+$" /proc/self/status
+              grep -Eq "^NoNewPrivs:[[:space:]]+1$" /proc/self/status
+              /bin/bash /input/install.sh --prefix=/toolchain --disable-ldconfig
+              /toolchain/bin/rustc --version --verbose
+              /toolchain/bin/cargo --version
+            '
+          printf '%s\n' '3690cc576ede140504698405d5d8fa3826aaadbe71699c6c4ed0a565d6f493e2  tool/bin/rustc' 'ff3022fcbd13b08434ea7afde9a0ef9d5b3f5c17b5fc7a40031be3ee000a6a24  tool/bin/cargo' | sha256sum -c -
+          # Fetch the exact public upstream commit; no upstream CI is run.
+          commit=1238aae8fc64b212641190a9227c8a734ab1a793
+          tree=ba5c80c1ba7d268cb91e34b153f161646737d9ec
+          gitclean() { clean /usr/bin/env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 /usr/bin/git -c core.hooksPath=/dev/null "$@"; }
+          gitclean init -q "$root/upstream"
+          gitclean -C "$root/upstream" fetch --no-tags --depth=1 https://github.com/bitwarden/sm-action.git "$commit"
+          test "$(gitclean -C "$root/upstream" rev-parse FETCH_HEAD)" = "$commit"
+          test "$(gitclean -C "$root/upstream" rev-parse 'FETCH_HEAD^{tree}')" = "$tree"
+          gitclean -C "$root/upstream" archive "$commit" Cargo.toml Cargo.lock LICENSE src | tar -xf - -C "$root/src"
+          while read -r pin path; do
+            test "$(gitclean hash-object --no-filters "$root/src/$path")" = "$pin"
+          done <<'PINS'
+          570832c893c2eafe6a918329c5510b5810245902 Cargo.toml
+          279d24b39d2978eb3ab5944e6e56f2a8db8428a7 Cargo.lock
+          2ca8921c939df8b53902a93aae162b06562c5ee7 src/main.rs
+          eed4ce7a14f4249be82189f1b2f1df4c6d6e271d src/config.rs
+          08e184384973134e68bad14fe8d1d4ec4af25f72 src/ci.rs
+          e72bfddabc15be5718a7cc061ac10e47741d8219 LICENSE
+          PINS
+          test "$(find "$root/src" -type f | wc -l)" -eq 6
+          cat > "$root/capture.py" <<'CAPTURE_PY'
+          import os, pathlib, stat, struct, hashlib, subprocess, sys, tempfile
+          
+          LIMIT = 16 * 1024 * 1024
+          PREVIEW = 512 * 1024
+          
+          def encode(data):
+              # Escape every delimiter byte, percent, control and non-ASCII byte.
+              return "".join(chr(b) if 32 <= b < 127 and b not in (35, 37, 58)
+                             else "%%%02X" % b for b in data)
+          
+          def capture(argv, path, limit, cancel):
+              total = 0
+              with open(path, "xb") as out:
+                  p = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, bufsize=0)
+                  try:
+                      while True:
+                          data = p.stdout.read(65536)
+                          if not data:
+                              break
+                          if len(data) > limit - total:
+                              cancel()
+                              return 125
+                          out.write(data)
+                          total += len(data)
+                      return p.wait()
+                  finally:
+                      if p.poll() is None:
+                          p.kill()
+                      p.wait()
+                      p.stdout.close()
+          
+          def replay(path):
+              size = path.stat().st_size
+              assert size <= LIMIT
+              with path.open("rb") as f:
+                  first = f.read(PREVIEW)
+                  if size > 2 * PREVIEW:
+                      f.seek(-PREVIEW, os.SEEK_END)
+                      tail = f.read(PREVIEW)
+                      parts = [first, tail]
+                  else:
+                      parts = [first + f.read(PREVIEW)]
+              print("ACCM_CAPTURE_BYTES=" + str(size))
+              for idx, part in enumerate(parts):
+                  if idx:
+                      print("ACCM_CAPTURE_MIDDLE_OMITTED")
+                  for line in part.split(b"\n"):
+                      for offset in range(0, max(1, len(line)), 4096):
+                          safe = encode(line[offset:offset + 4096])
+                          assert "::" not in safe and "##[" not in safe
+                          print("BUILD | " + safe)
+          
+          def selftest():
+              payload = bytes(range(256)) + b"::::::##[::" + b"x" * 20000
+              safe = encode(payload)
+              assert "::" not in safe and "##[" not in safe
+              assert "\r" not in safe and "\n" not in safe
+              from urllib.parse import unquote_to_bytes
+              assert unquote_to_bytes(safe) == payload
+              with tempfile.TemporaryDirectory() as tmp:
+                  root = pathlib.Path(tmp)
+                  p = root / "ok"
+                  assert capture([sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'ok\\n')"], p, 64, lambda: None) == 0
+                  assert p.read_bytes() == b"ok\n"
+                  p = root / "overflow"
+                  cancelled = []
+                  assert capture([sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x'*8192)"],
+                                 p, 1024, lambda: cancelled.append(True)) == 125
+                  assert cancelled == [True] and p.stat().st_size <= 1024
+                  p = root / "replay"
+                  p.write_bytes(payload + b"\n" + b":::##[::\r\x1b")
+                  from contextlib import redirect_stdout
+                  from io import StringIO
+                  out = StringIO()
+                  with redirect_stdout(out):
+                      replay(p)
+                  lines = out.getvalue().splitlines()
+                  assert lines[0].startswith("ACCM_CAPTURE_BYTES=")
+                  assert all(line.startswith("BUILD | ") for line in lines[1:])
+                  assert all("::" not in line and "##[" not in line for line in lines)
+                  assert all(len(line) <= 8 + 4096 * 3 for line in lines[1:])
+                  p = root / "failure"
+                  assert capture([sys.executable, "-c", "import sys; sys.exit(7)"],
+                                 p, 64, lambda: None) == 7
+              print("ACCM_CAPTURE_SELFTEST_PASS")
+          
+          def seal(source, target):
+              # Container has stopped. Only a regular, single-link bounded ELF may cross.
+              fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+              with os.fdopen(fd, "rb") as f:
+                  s = os.fstat(f.fileno())
+                  assert stat.S_ISREG(s.st_mode) and s.st_nlink == 1
+                  assert 64 <= s.st_size <= 64 * 1024 * 1024
+                  data = f.read(64 * 1024 * 1024 + 1)
+                  assert len(data) == s.st_size
+              assert data[:6] == b"\x7fELF\x02\x01" and struct.unpack_from("<H", data, 18)[0] == 62
+              with open(target, "xb") as f:
+                  f.write(data)
+              os.chmod(target, 0o555)
+              print("CANDIDATE_BYTES=" + str(len(data)))
+              print("CANDIDATE_SHA256=" + hashlib.sha256(data).hexdigest())
+          
+          if __name__ == "__main__":
+              if sys.argv[1:] == ["--selftest"]:
+                  selftest()
+              elif sys.argv[1] == "--seal":
+                  seal(sys.argv[2], sys.argv[3])
+              else:
+                  path, name = pathlib.Path(sys.argv[1]), sys.argv[2]
+                  def cancel():
+                      try:
+                          subprocess.run(["/usr/bin/docker", "rm", "-f", name],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                         timeout=15, check=False)
+                      except (OSError, subprocess.TimeoutExpired):
+                          pass
+                  result = capture(sys.argv[3:], path, LIMIT, cancel)
+                  replay(path)
+                  if result == 125:
+                      print("ACCM_CAPTURE_OVERFLOW_OR_EXIT125")
+                  sys.exit(result if 0 <= result <= 255 else 1)
+          CAPTURE_PY
+          clean /usr/bin/python3 "$root/capture.py" --selftest
+          cat > "$root/registry.py" <<'REGISTRY_PY'
+          import base64, concurrent.futures, hashlib, ipaddress, json, os, re, socket, stat, subprocess, sys, tomllib
+          from pathlib import Path
+          TARGETS = {"rustls":"0.23.46","rustls-webpki":"0.103.16","h2":"0.4.16","url":"2.5.9","crypto-bigint":"0.7.9","ctutils":"0.4.5","crossbeam-epoch":"0.9.20","form_urlencoded":"1.2.3"}
+          # Exact non-yanked rows independently retrieved from crates.io-index commit 1550b7e089a3c3e864f1cf50cce3e928554bce09.
+          TARGET_SHA = {"rustls":"48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf","rustls-webpki":"4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281","h2":"a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27","url":"f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a","crypto-bigint":"d811ea23fdfbcce2e2d5132344d471abdb8f901ac496a0893a3df92e70525e52","ctutils":"38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0","crossbeam-epoch":"2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f","form_urlencoded":"afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"}
+          assert set(TARGETS)==set(TARGET_SHA)
+          SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+          ROOT = ("sm-action","3.0.1")
+          OLD_SHA = "cf301ce7de2e66b03cfbe7174b7a91e058f367a3c0bdf5cf5a4bbb52ba92445a"
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+          def canonical(obj):
+              return (json.dumps(obj,sort_keys=True,separators=(",",":"))+"\n").encode()
+          def identity(n,v):
+              assert isinstance(n,str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}",n)
+              assert isinstance(v,str) and re.fullmatch(r"[0-9][A-Za-z0-9.+-]{0,95}",v)
+              return n,v
+          def parse(data):
+              doc=tomllib.loads(data.decode("utf-8"))
+              assert set(doc)=={"version","package"} and doc["version"]==4
+              packages={}
+              for p in doc["package"]:
+                  assert set(p)<= {"name","version","source","checksum","dependencies"}
+                  k=identity(p["name"],p["version"])
+                  assert k not in packages
+                  if k==ROOT:
+                      assert "source" not in p and "checksum" not in p
+                  else:
+                      assert k[0]!=ROOT[0] and p["source"]==SOURCE
+                      assert re.fullmatch(r"[0-9a-f]{64}",p["checksum"])
+                  packages[k]=p
+              assert ROOT in packages
+              byname={}
+              for k in packages:
+                  byname.setdefault(k[0],[]).append(k)
+              edges=set()
+              for k,p in packages.items():
+                  deps=p.get("dependencies",[])
+                  assert isinstance(deps,list) and len(deps)==len(set(deps))
+                  for d in deps:
+                      assert isinstance(d,str)
+                      parts=d.split(" ")
+                      assert len(parts) in (1,2)
+                      if len(parts)==1:
+                          found=byname.get(parts[0],[])
+                          assert len(found)==1
+                          dest=found[0]
+                      else:
+                          dest=identity(*parts)
+                          assert dest in packages
+                      edges.add((k,dest))
+              reached={ROOT}
+              while True:
+                  more={b for a,b in edges if a in reached}
+                  if more<=reached: break
+                  reached |= more
+              assert reached==set(packages),"Unreachable lock entry"
+              return packages,edges
+          def old_lock():
+              data=Path("src/Cargo.lock").read_bytes()
+              assert sha(data)==OLD_SHA
+              pk,edges=parse(data)
+              assert len(pk)==388
+              return pk,edges
+          def index_path(n):
+              n=n.lower()
+              if len(n)==1: return "1/"+n
+              if len(n)==2: return "2/"+n
+              if len(n)==3: return "3/"+n[0]+"/"+n
+              return n[:2]+"/"+n[2:4]+"/"+n
+          def public_ip(host):
+              ips=sorted({x[4][0] for x in socket.getaddrinfo(host,443,socket.AF_INET,socket.SOCK_STREAM)})
+              assert ips and all(ipaddress.ip_address(x).is_global for x in ips)
+              return ips[0]
+          def acquire():
+              pk,_=old_lock()
+              allowed={k:p["checksum"] for k,p in pk.items() if k!=ROOT}
+              for n,v in TARGETS.items():
+                  assert any(k[0]==n for k in allowed)
+                  assert (n,v) not in allowed
+                  allowed[n,v]=TARGET_SHA[n]
+              assert len(allowed)==395
+              hosts={h:public_ip(h) for h in ("index.crates.io","static.crates.io")}
+              reg=Path("registry")
+              (reg/"index").mkdir()
+              def get(host,path,limit):
+                  assert host in hosts and re.fullmatch(r"[A-Za-z0-9_./+-]+",path)
+                  assert ".." not in path.split("/") and not path.startswith("/")
+                  result=subprocess.run(["/usr/bin/curl","--disable","--fail","--silent","--show-error",
+                      "--proto","=https","--noproxy","*","--proxy","","--ipv4",
+                      "--resolve",host+":443:"+hosts[host],"--connect-timeout","15",
+                      "--max-time","90","--max-filesize",str(limit),
+                      "--write-out","%{http_code}","--output",str(reg/"download"/path.replace("/","_")),
+                      "https://"+host+"/"+path],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,check=True,timeout=95)
+                  assert result.stdout==b"200","Non-200 or redirect refused"
+                  p=reg/"download"/path.replace("/","_")
+                  assert 0<p.stat().st_size<=limit
+                  data=p.read_bytes()
+                  p.unlink()
+                  return data
+              (reg/"download").mkdir()
+              names=sorted({k[0] for k in allowed})
+              def index(n):
+                  path=index_path(n)
+                  raw=get("index.crates.io",path,8*1024*1024)
+                  chosen={}
+                  for line in raw.splitlines():
+                      row=json.loads(line)
+                      k=identity(row["name"],row["vers"])
+                      assert k[0]==n
+                      if k in allowed:
+                          assert k not in chosen and re.fullmatch(r"[a-f0-9]{64}",row["cksum"])
+                          assert isinstance(row["yanked"],bool)
+                          assert allowed[k]==row["cksum"],"Registry checksum changed for "+k[0]+" "+k[1]
+                          if TARGETS.get(k[0])==k[1]:
+                              assert not row["yanked"],"Target yanked: "+k[0]+" "+k[1]
+                          chosen[k]=row
+                  assert set(chosen)=={k for k in allowed if k[0]==n},"Missing exact version for "+n
+                  out=reg/"index"/path
+                  out.parent.mkdir(parents=True,exist_ok=True)
+                  out.write_bytes(b"".join(canonical(chosen[k]) for k in sorted(chosen)))
+                  return {k:r["cksum"] for k,r in chosen.items()}
+              checks={}
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                  for part in ex.map(index,names): checks.update(part)
+              assert set(checks)==set(allowed)
+              for n,v in sorted(TARGETS.items()):
+                  print("ACCM_TARGET_AVAILABLE "+n+" "+v+" "+checks[n,v])
+              total=0
+              def archive(k):
+                  n,v=k
+                  file=n+"-"+v+".crate"
+                  raw=get("static.crates.io","crates/"+n+"/"+file,32*1024*1024)
+                  assert sha(raw)==checks[k],"Crate checksum mismatch"
+                  (reg/file).write_bytes(raw)
+                  return len(raw)
+              # At most eight in-flight files above the checked aggregate ceiling.
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                  for i in range(0,len(checks),8):
+                      batch=sorted(checks)[i:i+8]
+                      total+=sum(ex.map(archive,batch))
+                      assert total<=768*1024*1024,"Registry byte ceiling"
+              (reg/"download").rmdir()
+              inventory={p.relative_to(reg).as_posix():sha(p.read_bytes()) for p in sorted(reg.rglob("*")) if p.is_file()}
+              Path("registry-inventory.json").write_bytes(canonical(inventory))
+              Path("allowed-checksums.json").write_bytes(canonical([{"name":n,"version":v,"sha256":checks[n,v]} for n,v in sorted(checks)]))
+              print("ACCM_REGISTRY_ARCHIVES="+str(len(checks)))
+              print("ACCM_REGISTRY_BYTES="+str(total))
+              print("ACCM_REGISTRY_INVENTORY_SHA256="+sha(Path("registry-inventory.json").read_bytes()))
+          def decode_lock_frame(raw):
+              # The transfer is the existing hard-capped subprocess pipe, not a host mount.
+              assert 0<len(raw)<=16*1024*1024
+              begin=b"ACCM_RESOLVER_LOCK_FRAME_BEGIN"
+              end=b"ACCM_RESOLVER_LOCK_FRAME_END"
+              lines=raw.split(b"\n")
+              assert lines.count(begin)==1 and lines.count(end)==1
+              i,j=lines.index(begin),lines.index(end)
+              assert j==i+2 and j==len(lines)-2 and lines[-1]==b""
+              encoded=lines[i+1]
+              limit=512*1024
+              assert 0<len(encoded)<=4*((limit+2)//3)
+              data=base64.b64decode(encoded,validate=True)
+              assert 0<len(data)<=limit and base64.b64encode(data)==encoded
+              return data
+          def read_output():
+              # Only a host-created, bounded log file is opened; resolver has no host write mount.
+              rootfd=os.open(".",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+              try:
+                  fd=os.open("resolve.log",os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=rootfd)
+                  with os.fdopen(fd,"rb") as f:
+                      s=os.fstat(f.fileno())
+                      assert stat.S_ISREG(s.st_mode) and s.st_nlink==1 and 0<s.st_size<=16*1024*1024
+                      raw=f.read(16*1024*1024+1)
+                      assert len(raw)==s.st_size
+                      return decode_lock_frame(raw)
+              finally: os.close(rootfd)
+          def frame_selftest():
+              import binascii
+              start=b"ACCM_RESOLVER_LOCK_FRAME_BEGIN\n"
+              stop=b"\nACCM_RESOLVER_LOCK_FRAME_END\n"
+              payload=b"x"*(512*1024)
+              good=start+base64.b64encode(payload)+stop
+              assert decode_lock_frame(b"diagnostic\n"+good)==payload
+              cases=[good+good,good+b"trailing\n",start+b"%%%"+stop,
+                     start+base64.b64encode(payload+b"x")+stop,
+                     start+b""+stop,good.replace(b"\nACCM_RESOLVER_LOCK_FRAME_END",b"\nextra\nACCM_RESOLVER_LOCK_FRAME_END"),
+                     b"x"*(16*1024*1024)+good]
+              for bad in cases:
+                  try: decode_lock_frame(bad)
+                  except (AssertionError,ValueError,binascii.Error): continue
+                  raise AssertionError("Invalid transfer accepted")
+              print("ACCM_LOCK_FRAME_SELFTEST_PASS")
+          def validate():
+              before,oldedges=old_lock()
+              data=read_output()
+              after,newedges=parse(data)
+              checks={(x["name"],x["version"]):x["sha256"] for x in json.loads(Path("allowed-checksums.json").read_bytes())}
+              for k,p in after.items():
+                  if k!=ROOT: assert checks[k]==p["checksum"]
+              for n,v in TARGETS.items():
+                  assert {x for a,x in after if a==n}=={v}
+              def sdk(pkgs):
+                  return {k:v.get("checksum") for k,v in pkgs.items() if k[0]=="bitwarden" or k[0].startswith("bitwarden-")}
+              assert sdk(before)==sdk(after)
+              for k in before.keys() & after.keys():
+                  assert before[k].get("checksum")==after[k].get("checksum")
+              removed=sorted(before.keys()-after.keys())
+              added=sorted(after.keys()-before.keys())
+              assert len(removed)+len(added)<=80
+              assert len(oldedges^newedges)<=1024
+              for k in removed: print("LOCK_REMOVED "+" ".join(k))
+              for k in added: print("LOCK_ADDED "+" ".join(k))
+              for a,b in sorted(oldedges-newedges): print("EDGE_REMOVED "+" ".join(a)+" -> "+" ".join(b))
+              for a,b in sorted(newedges-oldedges): print("EDGE_ADDED "+" ".join(a)+" -> "+" ".join(b))
+              Path("sealed/Cargo.lock").write_bytes(data)
+              Path("lock-digest").write_text(sha(data))
+              print("ACCM_PATCH_LOCK_SCHEMA_AND_EDGES_PASS")
+          def emit():
+              data=Path("sealed/Cargo.lock").read_bytes()
+              assert sha(data)==Path("lock-digest").read_text()
+              print("ACCM_PATCH_LOCK_SHA256="+sha(data))
+              print("ACCM_PATCH_LOCK_BASE64_BEGIN")
+              encoded=base64.b64encode(data).decode("ascii")
+              for i in range(0,len(encoded),4096): print(encoded[i:i+4096])
+              print("ACCM_PATCH_LOCK_BASE64_END")
+              print("ACCM_PATCH_RESOLUTION_PASS_NOT_ADMITTED")
+          if __name__=="__main__":
+              {"acquire":acquire,"validate":validate,"emit":emit,"selftest":frame_selftest}[sys.argv[1]]()
+          REGISTRY_PY
+          # Host-side fixed public data acquisition only; no Cargo network access.
+          # Each baseline and exact target crate is pinned against its index checksum.
+          clean /usr/bin/python3 "$root/registry.py" selftest
+          clean /usr/bin/python3 "$root/registry.py" acquire
+          mkdir -m 700 "$root/sealed"
+          cp -a "$root/src/." "$root/sealed/"
+          # Cargo local-registry, restricted to original versions plus seven targets.
+          # No writable host bind mount. The host capture pipe bounds all output.
+          clean /usr/bin/python3 "$root/capture.py" "$root/resolve.log" "$release_name" /usr/bin/docker run "${common[@]}" "${offline[@]}" --name "$release_name" --log-driver none \
+            --tmpfs "/patch:rw,nosuid,nodev,size=16m,mode=0700,uid=$uid,gid=$gid" \
+            --tmpfs "/cargo-home:rw,nosuid,nodev,noexec,size=3g,mode=0700,uid=$uid,gid=$gid" \
+            --mount "type=bind,source=$root/tool,target=/toolchain,readonly" \
+            --mount "type=bind,source=$root/src/Cargo.toml,target=/patch/Cargo.toml,readonly" \
+            --mount "type=bind,source=$root/src/src,target=/patch/src,readonly" \
+            --mount "type=bind,source=$root/src/Cargo.lock,target=/baseline.lock,readonly" \
+            --mount "type=bind,source=$root/registry,target=/registry,readonly" \
+            --env HOME=/tmp --env CARGO_HOME=/cargo-home --env RUSTC=/toolchain/bin/rustc \
+            --env CARGO_NET_OFFLINE=true --env PATH=/toolchain/bin:/usr/bin:/bin \
+            --workdir /patch --entrypoint /bin/bash "$builder" --noprofile --norc -euc '
+              set -o pipefail
+              test "$(id -u)" = "$EXPECTED_UID"
+              test "$(id -u)" -ne 0
+              test "$(readlink /proc/self/ns/net)" != "$HOST_NETNS"
+              test "$(ls -1 /sys/class/net)" = lo
+              test "$(wc -l < /proc/net/route)" -eq 1
+              grep -Eq "^CapEff:[[:space:]]+0+$" /proc/self/status
+              grep -Eq "^CapBnd:[[:space:]]+0+$" /proc/self/status
+              grep -Eq "^NoNewPrivs:[[:space:]]+1$" /proc/self/status
+              grep -Eq "^Seccomp:[[:space:]]+2$" /proc/self/status
+              test ! -S /var/run/docker.sock
+              for path in /patch/Cargo.toml /baseline.lock /patch/src/.write-probe /registry/.write-probe /toolchain/.write-probe; do
+                if touch "$path" 2>/dev/null; then exit 11; fi
+              done
+              cp /baseline.lock Cargo.lock
+              printf "%s\n" "[source.crates-io]" "replace-with = \"local-snapshot\"" "[source.local-snapshot]" "local-registry = \"/registry\"" "[net]" "offline = true" > "$CARGO_HOME/config.toml"
+              cargo update --offline -p rustls-webpki --precise 0.103.16
+              cargo update --offline -p rustls --precise 0.23.46
+              cargo update --offline -p h2 --precise 0.4.16
+              cargo update --offline -p form_urlencoded --precise 1.2.3
+              cargo update --offline -p url --precise 2.5.9
+              cargo update --offline -p ctutils --precise 0.4.5
+              cargo update --offline -p crypto-bigint --precise 0.7.9
+              cargo update --offline -p crossbeam-epoch --precise 0.9.20
+              test -f Cargo.lock && test ! -L Cargo.lock || exit 21
+              test "$(stat -c %h Cargo.lock)" -eq 1
+              test "$(stat -c %s Cargo.lock)" -gt 0
+              test "$(stat -c %s Cargo.lock)" -le 524288
+              printf "%s\n" ACCM_RESOLVER_LOCK_FRAME_BEGIN
+              base64 -w 0 Cargo.lock
+              printf "\n%s\n" ACCM_RESOLVER_LOCK_FRAME_END
+            '
+          clean /usr/bin/python3 "$root/registry.py" validate
+          # Fresh offline verifier receives only the host-sealed exact lock and original source.
+          clean /usr/bin/python3 "$root/capture.py" "$root/validate.log" "$test_name" /usr/bin/docker run "${common[@]}" "${offline[@]}" --name "$test_name" --log-driver none \
+            --tmpfs "/cargo-home:rw,nosuid,nodev,noexec,size=3g,mode=0700,uid=$uid,gid=$gid" \
+            --mount "type=bind,source=$root/tool,target=/toolchain,readonly" \
+            --mount "type=bind,source=$root/sealed,target=/patch,readonly" \
+            --mount "type=bind,source=$root/registry,target=/registry,readonly" \
+            --env HOME=/tmp --env CARGO_HOME=/cargo-home --env RUSTC=/toolchain/bin/rustc \
+            --env CARGO_NET_OFFLINE=true --env PATH=/toolchain/bin:/usr/bin:/bin \
+            --workdir /patch --entrypoint /bin/bash "$builder" --noprofile --norc -euc '
+              test "$(id -u)" = "$EXPECTED_UID"
+              test "$(id -u)" -ne 0
+              test "$(readlink /proc/self/ns/net)" != "$HOST_NETNS"
+              test "$(ls -1 /sys/class/net)" = lo
+              test "$(wc -l < /proc/net/route)" -eq 1
+              grep -Eq "^CapEff:[[:space:]]+0+$" /proc/self/status
+              grep -Eq "^CapBnd:[[:space:]]+0+$" /proc/self/status
+              grep -Eq "^NoNewPrivs:[[:space:]]+1$" /proc/self/status
+              grep -Eq "^Seccomp:[[:space:]]+2$" /proc/self/status
+              test ! -S /var/run/docker.sock
+              if touch /patch/Cargo.lock 2>/dev/null; then exit 11; fi
+              printf "%s\n" "[source.crates-io]" "replace-with = \"local-snapshot\"" "[source.local-snapshot]" "local-registry = \"/registry\"" "[net]" "offline = true" > "$CARGO_HOME/config.toml"
+              cargo metadata --frozen --format-version 1 > /tmp/metadata.json
+              test -s /tmp/metadata.json
+            '
+          echo ACCM_FULL_LOCKED_METADATA_PASS
+          clean /usr/bin/python3 "$root/registry.py" emit

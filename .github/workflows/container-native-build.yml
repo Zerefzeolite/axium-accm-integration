@@ -86,11 +86,14 @@ jobs:
           test "$(docker image inspect "$image" --format '{{.Id}}')" = sha256:2b147973fd863c93ced60f325461fe0e262b91317b008e6a2d961f13e81af0e4
           # Public CA bundle for HTTPS bootstrap; apt still authenticates signed
           # Ubuntu metadata and verifies all archive hashes. No host home/context.
-          cp /etc/ssl/certs/ca-certificates.crt context/bootstrap-ca.crt
+          install -m 0644 /etc/ssl/certs/ca-certificates.crt context/bootstrap-ca.crt
           cat > context/Dockerfile <<'DOCKERFILE'
           FROM docker.io/library/ubuntu@sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe19e4081cb93a90bf56819d6a
-          COPY bootstrap-ca.crt /opt/bootstrap-ca.crt
+          COPY --chmod=0644 bootstrap-ca.crt /opt/bootstrap-ca.crt
           RUN set -eux; \
+              test "$(stat -c %a /opt/bootstrap-ca.crt)" = 644; \
+              runuser -u _apt -- test -r /opt/bootstrap-ca.crt; \
+              runuser -u _apt -- grep -q '^-----BEGIN CERTIFICATE-----$' /opt/bootstrap-ca.crt; \
               mkdir -p /opt/accm-inventory; \
               rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* /etc/apt/apt.conf.d/docker-clean; \
               printf '%s\n' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261125T000000Z/ noble main universe' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261125T000000Z/ noble-updates main universe' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261125T000000Z/ noble-security main universe' > /etc/apt/sources.list; \

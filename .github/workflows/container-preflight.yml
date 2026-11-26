@@ -70,7 +70,8 @@ jobs:
           hostnet="$(readlink /proc/self/ns/net)"
           # Only the verified distribution directory enters the container.
           # No runner checkout, home, Docker socket, tokens, or provider data.
-          cid="$(docker create --pull never --platform linux/amd64 --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --user "$uid:$gid" --pids-limit 256 --memory 8g --cpus 2 --tmpfs "/work:rw,nosuid,nodev,size=4g,uid=$uid,gid=$gid,mode=0700" --tmpfs "/tmp:rw,nosuid,nodev,size=256m,mode=1777" --mount "type=bind,source=$root/rust-1.98.0-x86_64-unknown-linux-gnu,target=/input,readonly" --env "EXPECTED_UID=$uid" --env "HOST_NETNS=$hostnet" --env HOME=/work --env LC_ALL=C --env TZ=UTC --workdir /work --entrypoint /bin/bash "$image" --noprofile --norc -euc '
+          cid="$(docker create --pull never --platform linux/amd64 --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --user "$uid:$gid" --pids-limit 256 --memory 8g --cpus 2 --tmpfs "/work:rw,nosuid,nodev,size=4g,exec,uid=$uid,gid=$gid,mode=0700" --tmpfs "/tmp:rw,nosuid,nodev,size=256m,mode=1777" --mount "type=bind,source=$root/rust-1.98.0-x86_64-unknown-linux-gnu,target=/input,readonly" --env "EXPECTED_UID=$uid" --env "HOST_NETNS=$hostnet" --env HOME=/work --env LC_ALL=C --env TZ=UTC --workdir /work --entrypoint /bin/bash "$image" --noprofile --norc -euc '
+            set -o pipefail
             test "$(id -u)" = "$EXPECTED_UID"
             test "$(id -u)" -ne 0
             test "$(readlink /proc/self/ns/net)" != "$HOST_NETNS"

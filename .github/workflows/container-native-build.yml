@@ -256,6 +256,8 @@ jobs:
           # Only the disposable work directory and container tmpfs are writable.
           # Source, toolchain and vendor tree remain read-only in offline build.
           test "$(df --output=avail -k "$root" | tail -n1)" -ge 6291456
+          # Capture untrusted compiler and test output before exposing it to Actions.
+          build_rc=0
           docker run "${common[@]}" "${offline[@]}" \
             --mount "type=bind,source=$root/tool,target=/toolchain,readonly" \
             --mount "type=bind,source=$root/src,target=/src,readonly" \
@@ -281,6 +283,9 @@ jobs:
               if timeout 3 bash -c "echo > /dev/tcp/192.0.2.1/443" 2>/dev/null; then exit 13; fi
               mkdir -p "$HOME" "$CARGO_HOME"
               printf "%s\n" "[source.crates-io]" "replace-with = \"vendored-sources\"" "[source.vendored-sources]" "directory = \"/vendor\"" "[net]" "offline = true" > "$CARGO_HOME/config.toml"
+              echo ACCM_LINUX_FEATURE_GRAPH_BEGIN
+              cargo tree --frozen --target x86_64-unknown-linux-gnu --edges normal,build,features --prefix depth
+              echo ACCM_LINUX_FEATURE_GRAPH_END
               RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --frozen --target x86_64-unknown-linux-gnu
               cp /work/target/x86_64-unknown-linux-gnu/release/sm-action /work/candidate
               sha256sum /work/candidate > /work/binary.sha256
@@ -294,6 +299,17 @@ jobs:
               echo "CANDIDATE_BYTES=$(stat -c %s /work/candidate)"
               echo "CANDIDATE_SHA256=$(cut -d " " -f1 /work/binary.sha256)"
               echo ACCM_CONTAINER_NATIVE_BUILD_AND_TEST_PASS
-            '
+            ' > "$root/native-build.log" 2>&1 || build_rc=$?
+          # Do not let child-process output become GitHub workflow commands.
+          clean /usr/bin/python3 - "$root/native-build.log" <<'PY'
+          import sys, pathlib
+          path = pathlib.Path(sys.argv[1])
+          assert path.stat().st_size <= 16 * 1024 * 1024, 'Build log exceeds bounded review size'
+          for line in path.read_text(errors='replace').splitlines():
+              safe = ''.join(ch if ch.isprintable() or ch == '\t' else '?' for ch in line)
+              safe = safe.replace('::', ': :').replace('##[', '# #[')
+              print('BUILD | ' + safe[:16384])
+          PY
+          test "$build_rc" -eq 0
           echo "BUILD_INPUT_MANIFEST_SHA256=$manifest_sha"
           echo ACCM_HOSTED_BUILD_CANDIDATE_NOT_ADMITTED

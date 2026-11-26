@@ -6,32 +6,61 @@ concurrency:
   group: synthetic-qualification
   cancel-in-progress: false
 jobs:
+  dependency:
+    if: github.repository == 'Zerefzeolite/axium-accm-integration' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == github.repository_owner && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Verify official release bytes and native version without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$(mktemp -d "$RUNNER_TEMP/accm-dependency.XXXXXX")"
+          trap 'rm -rf -- "$dir"' EXIT
+          bin="$dir/sm-action"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 60 --output "$bin" 'https://github.com/bitwarden/sm-action/releases/download/v3.0.1/sm-action-x86_64-unknown-linux-gnu'
+          test "$(stat -c %s "$bin")" = 9021712
+          printf '%s  %s\n' 'fa998e9db775d5c7bdbc0fd8840ac6474a8348cdc989176c5ce24c3d09045752' "$bin" | sha256sum --check --status
+          chmod 0500 "$bin"
+          test "$("$bin" --version)" = 3.0.1
+          printf '%s\n' 'PUBLIC_DEPENDENCY_NATIVE_PASS'
   qualify:
+    needs: dependency
     if: github.repository == 'Zerefzeolite/axium-accm-integration' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == github.repository_owner && github.run_attempt == 1 && github.sha == vars.APPROVED_SHA
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     environment: synthetic-qualification
     steps:
-      - name: Validate the synthetic fixture identifier
-        id: fixture
+      - name: Verify release bytes before credential access
+        id: dependency
         shell: bash
-        env:
-          FIXTURE_UUID: ${{ vars.SYNTHETIC_FIXTURE_UUID }}
         run: |
           set -euo pipefail
-          if [[ ! "$FIXTURE_UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-            printf '%s\n' 'INVALID_SYNTHETIC_FIXTURE_ID' >&2
-            exit 1
-          fi
-          printf 'id=%s\n' "$FIXTURE_UUID" >> "$GITHUB_OUTPUT"
-      - name: Retrieve the disposable synthetic fixture
-        uses: bitwarden/sm-action@f1de238fc00c738c56140796018be9084c2b5d21
-        with:
-          access_token: ${{ secrets.SYNTHETIC_BW_ACCESS_TOKEN }}
-          cloud_region: us
-          secrets: |
-            ${{ steps.fixture.outputs.id }} > SYNTHETIC_FIXTURE
-      - name: Compare the public synthetic marker without printing retrieved data
+          dir="$(mktemp -d "$RUNNER_TEMP/accm-synthetic.XXXXXX")"
+          bin="$dir/sm-action"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 60 --output "$bin" 'https://github.com/bitwarden/sm-action/releases/download/v3.0.1/sm-action-x86_64-unknown-linux-gnu'
+          test "$(stat -c %s "$bin")" = 9021712
+          printf '%s  %s\n' 'fa998e9db775d5c7bdbc0fd8840ac6474a8348cdc989176c5ce24c3d09045752' "$bin" | sha256sum --check --status
+          chmod 0500 "$bin"
+          test "$("$bin" --version)" = 3.0.1
+          printf 'path=%s\n' "$bin" >> "$GITHUB_OUTPUT"
+      - name: Read and compare only the disposable synthetic marker
+        shell: bash
+        env:
+          VERIFIED_BIN: ${{ steps.dependency.outputs.path }}
+          FIXTURE_UUID: ${{ vars.SYNTHETIC_FIXTURE_UUID }}
+          INPUT_ACCESS_TOKEN: ${{ secrets.SYNTHETIC_BW_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          set +x
+          [[ -z "${RUNNER_DEBUG+x}" && -z "${ACTIONS_RUNNER_DEBUG+x}" ]] || { printf '%s\n' 'DEBUG_NOT_ALLOWED' >&2; exit 1; }
+          [[ "$FIXTURE_UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || { printf '%s\n' 'INVALID_SYNTHETIC_FIXTURE_ID' >&2; exit 1; }
+          [[ -n "$INPUT_ACCESS_TOKEN" ]] || { printf '%s\n' 'SYNTHETIC_TOKEN_NOT_CONFIGURED' >&2; exit 1; }
+          printf '%s  %s\n' 'fa998e9db775d5c7bdbc0fd8840ac6474a8348cdc989176c5ce24c3d09045752' "$VERIFIED_BIN" | sha256sum --check --status
+          export INPUT_SECRETS="$FIXTURE_UUID > SYNTHETIC_FIXTURE" INPUT_CLOUD_REGION=us INPUT_SET_ENV=true
+          unset INPUT_BASE_URL INPUT_API_URL INPUT_IDENTITY_URL
+          "$VERIFIED_BIN" || { printf '%s\n' 'SYNTHETIC_PROVIDER_FAILURE' >&2; exit 1; }
+      - name: Verify synthetic marker without displaying it
         shell: bash
         run: |
           set +x

@@ -1,0 +1,148 @@
+name: ACCM credential-free source qualification
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Preflight first; build requires reviewed manifest digest"
+        type: choice
+        options:
+          - preflight
+          - build
+        default: preflight
+      reviewed_manifest_sha256:
+        description: "Required only for build; exact independently reviewed environment manifest"
+        type: string
+        required: false
+permissions: {}
+concurrency:
+  group: accm-public-source-qualification
+  cancel-in-progress: false
+jobs:
+  qualify:
+    if: github.repository == 'Zerefzeolite/axium-accm-integration' && github.repository_id == '1472823260' && github.actor_id == '9297681' && github.ref == 'refs/heads/main' && github.run_attempt == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Verify official toolchain and runner; optionally build
+        env:
+          BUILD_MODE: ${{ inputs.mode }}
+          REVIEWED_MANIFEST_SHA256: ${{ inputs.reviewed_manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(id -u)" -ne 0
+          test "$(uname -m)" = x86_64
+          case "$BUILD_MODE" in preflight|build) ;; *) exit 2;; esac
+          if [[ "$BUILD_MODE" == build ]]; then
+            [[ "$REVIEWED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          fi
+          root="$(mktemp -d)"
+          trap 'rm -rf -- "$root"' EXIT
+          mkdir -m 700 "$root/home" "$root/gnupg" "$root/tmp"
+          cd "$root"
+          # No CI credentials or command channels are passed to fetched tools.
+          clean() { env -i PATH=/usr/bin:/bin HOME="$root/home" TMPDIR="$root/tmp" LC_ALL=C TZ=UTC "$@"; }
+          fetch() {
+            clean /usr/bin/curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 20 --max-time 600 --output "$2" "$1"
+          }
+          fetch https://static.rust-lang.org/rust-key.gpg.ascii rust-key.asc
+          fetch https://static.rust-lang.org/dist/channel-rust-1.98.0.toml manifest.toml
+          fetch https://static.rust-lang.org/dist/channel-rust-1.98.0.toml.asc manifest.asc
+          clean /usr/bin/gpg --homedir "$root/gnupg" --batch --import rust-key.asc
+          clean /usr/bin/gpg --homedir "$root/gnupg" --batch --with-colons --list-keys > key.txt
+          clean /usr/bin/gpg --homedir "$root/gnupg" --batch --status-fd 1 --verify manifest.asc manifest.toml > signature.txt
+          clean /usr/bin/python3 - <<'PY'
+          import pathlib, re, tomllib, urllib.parse
+          p = pathlib.Path
+          expected = "108F66205EAEB0AAA8DD5E1C85AB96E6FA1BE5FE"
+          rows = [x.split(":") for x in p("key.txt").read_text().splitlines()]
+          primary = [rows[i+1][9] for i, x in enumerate(rows) if x[0] == "pub" and rows[i+1][0] == "fpr"]
+          assert primary == [expected], "Unexpected signing key"
+          sigs = [x.split() for x in p("signature.txt").read_text().splitlines() if x.startswith("[GNUPG:] VALIDSIG ")]
+          assert len(sigs) == 1 and sigs[0][-1] == expected, "Wrong signer"
+          assert sigs[0][9] in {"8", "9", "10", "11"}, "Weak signature hash"
+          m = tomllib.loads(p("manifest.toml").read_text())
+          assert m["pkg"]["rust"]["version"].split()[0] == "1.98.0"
+          a = m["pkg"]["rust"]["target"]["x86_64-unknown-linux-gnu"]
+          assert a["available"] is True
+          u = urllib.parse.urlsplit(a["xz_url"])
+          assert u.scheme == "https" and u.netloc == "static.rust-lang.org"
+          assert re.fullmatch(r"/dist/(?:[0-9]{4}-[0-9]{2}-[0-9]{2}/)?rust-1\.98\.0-x86_64-unknown-linux-gnu\.tar\.xz", u.path)
+          assert not u.query and not u.fragment
+          assert re.fullmatch(r"[0-9a-f]{64}", a["xz_hash"])
+          p("archive-url.txt").write_text(a["xz_url"])
+          p("archive.sha256").write_text(a["xz_hash"] + "  rust.tar.xz\n")
+          PY
+          fetch "$(cat archive-url.txt)" rust.tar.xz
+          clean /usr/bin/sha256sum -c archive.sha256
+          # The signed manifest cryptographically binds the standalone archive.
+          clean /usr/bin/tar -xJf rust.tar.xz
+          test -f rust-1.98.0-x86_64-unknown-linux-gnu/install.sh
+          net_before="$(readlink /proc/self/ns/net)"
+          offline() {
+            clean /usr/bin/unshare --user --map-root-user --net -- /bin/sh -eu -c 'test "$(readlink /proc/self/ns/net)" != "$1"; shift; exec "$@"' sh "$net_before" "$@"
+          }
+          # No security settings are changed if user namespaces are unavailable.
+          offline /bin/true
+          offline /bin/bash "$root/rust-1.98.0-x86_64-unknown-linux-gnu/install.sh" --prefix="$root/toolchain" --disable-ldconfig
+          rustc="$root/toolchain/bin/rustc"
+          cargo="$root/toolchain/bin/cargo"
+          offline "$rustc" --version --verbose > rustc-version.txt
+          offline "$cargo" --version > cargo-version.txt
+          grep -q '^rustc 1\.98\.0 ' rustc-version.txt
+          grep -q '^host: x86_64-unknown-linux-gnu$' rustc-version.txt
+          grep -q '^cargo 1\.98\.0 ' cargo-version.txt
+          printf '%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" > image.txt
+          test "$(sed -n '1p' image.txt)" != unknown
+          test "$(sed -n '2p' image.txt)" != unknown
+          clean /usr/bin/dpkg-query -W -f='${Package}\t${Version}\n' | LC_ALL=C sort > packages.txt
+          clean /usr/bin/python3 - <<'PY'
+          import hashlib, json, pathlib, platform, subprocess
+          p = pathlib.Path
+          def sha(f):
+              with open(f, "rb") as h:
+                  return hashlib.file_digest(h, "sha256").hexdigest()
+          def tree(path):
+              out = {}
+              for f in sorted(p(path).rglob("*")):
+                  if f.is_symlink():
+                      out[str(f.relative_to(path))] = "symlink:" + str(f.readlink())
+                  elif f.is_file():
+                      out[str(f.relative_to(path))] = sha(f)
+              return out
+          doc = {"source": "1238aae8fc64b212641190a9227c8a734ab1a793",
+                 "toolchain": "1.98.0", "target": "x86_64-unknown-linux-gnu",
+                 "signing_key": "108F66205EAEB0AAA8DD5E1C85AB96E6FA1BE5FE",
+                 "image": p("image.txt").read_text().splitlines(),
+                 "kernel": platform.release(), "os_release": p("/etc/os-release").read_text(),
+                 "rust_manifest_sha256": sha("manifest.toml"),
+                 "archive_sha256": sha("rust.tar.xz"),
+                 "package_inventory_sha256": sha("packages.txt"),
+                 "rustc_version": p("rustc-version.txt").read_text(),
+                 "cargo_version": p("cargo-version.txt").read_text(),
+                 "rustc_sha256": sha("toolchain/bin/rustc"), "cargo_sha256": sha("toolchain/bin/cargo"),
+                 "system_tools": {s: sha(s) for s in ("/usr/bin/git", "/usr/bin/python3", "/usr/bin/gcc", "/usr/bin/ld", "/usr/bin/unshare", "/bin/sh")},
+                 "toolchain_tree_sha256": hashlib.sha256(json.dumps(tree("toolchain"), sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                 "namespace_probe": "passed"}
+          p("environment.json").write_text(json.dumps(doc, sort_keys=True, indent=2) + "\n")
+          PY
+          cat environment.json
+          manifest_sha="$(sha256sum environment.json | cut -d' ' -f1)"
+          printf 'ENVIRONMENT_MANIFEST_SHA256=%s\n' "$manifest_sha"
+          if [[ "$BUILD_MODE" == preflight ]]; then
+            echo ACCM_HOSTED_ENVIRONMENT_PREFLIGHT_PASS
+            exit 0
+          fi
+          test "$manifest_sha" = "$REVIEWED_MANIFEST_SHA256"
+          # Read exact source from the reviewed main commit, not a moving branch.
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          fetch "https://raw.githubusercontent.com/Zerefzeolite/axium-accm-integration/$GITHUB_SHA/qualification/build_candidate.py" build_candidate.py
+          test "$(clean /usr/bin/git hash-object --no-filters build_candidate.py)" = 863cd025ada375c57704272cc4a9afd21db2785a
+          rustc_sha="$(sha256sum "$rustc" | cut -d' ' -f1)"
+          cargo_sha="$(sha256sum "$cargo" | cut -d' ' -f1)"
+          # Candidate performs its own locked vendor and frozen offline build/tests.
+          clean /usr/bin/python3 "$root/build_candidate.py" --toolchain-dir "$root/toolchain" --rustc-sha256 "$rustc_sha" --cargo-sha256 "$cargo_sha" --admission-receipt "$root/environment.json" --admission-sha256 "$manifest_sha"
+          echo ACCM_HOSTED_BUILD_CANDIDATE_NOT_ADMITTED

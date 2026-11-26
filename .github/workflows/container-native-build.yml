@@ -1,0 +1,291 @@
+name: ACCM native container source build
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Inventory first; build requires reviewed manifest on main
+        type: choice
+        options: [inventory, build]
+        default: inventory
+      reviewed_manifest_sha256:
+        description: Exact approved manifest digest (build only)
+        type: string
+        required: false
+permissions: {}
+concurrency:
+  group: accm-public-source-qualification
+  cancel-in-progress: false
+jobs:
+  qualify:
+    if: github.repository == 'Zerefzeolite/axium-accm-integration' && github.repository_id == '1472823260' && github.actor_id == '9297681' && github.ref == 'refs/heads/main' && github.run_attempt == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - name: Measure fixed public build inputs; optionally compile offline
+        shell: bash
+        env:
+          BUILD_MODE: ${{ inputs.mode }}
+          REVIEWED_MANIFEST_SHA256: ${{ inputs.reviewed_manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(id -u)" -ne 0
+          test "$(uname -m)" = x86_64
+          case "$BUILD_MODE" in inventory|build) ;; *) exit 2;; esac
+          if [[ "$BUILD_MODE" == build ]]; then
+            [[ "$REVIEWED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          fi
+          root="$(mktemp -d)"
+          tag="accm-builder:$GITHUB_RUN_ID"
+          cleanup() {
+            docker image rm "$tag" >/dev/null 2>&1 || true
+            rm -rf -- "$root"
+          }
+          trap cleanup EXIT
+          mkdir -m 700 "$root/home" "$root/gnupg" "$root/tmp" "$root/context" "$root/tool" "$root/vendor" "$root/src" "$root/work" "$root/review"
+          cd "$root"
+          clean() { env -i PATH=/usr/bin:/bin HOME="$root/home" TMPDIR="$root/tmp" LC_ALL=C TZ=UTC "$@"; }
+          fetch() {
+            clean /usr/bin/curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 20 --max-time 600 --output "$2" "$1"
+          }
+          fetch https://static.rust-lang.org/rust-key.gpg.ascii rust-key.asc
+          fetch https://static.rust-lang.org/dist/channel-rust-1.98.0.toml manifest.toml
+          fetch https://static.rust-lang.org/dist/channel-rust-1.98.0.toml.asc manifest.asc
+          clean /usr/bin/gpg --homedir "$root/gnupg" --batch --import rust-key.asc
+          clean /usr/bin/gpg --homedir "$root/gnupg" --batch --with-colons --list-keys > key.txt
+          clean /usr/bin/gpg --homedir "$root/gnupg" --batch --status-fd 1 --verify manifest.asc manifest.toml > signature.txt
+          clean /usr/bin/python3 - <<'PY'
+          import pathlib, re, tomllib, urllib.parse
+          p = pathlib.Path
+          expected = "108F66205EAEB0AAA8DD5E1C85AB96E6FA1BE5FE"
+          rows = [x.split(":") for x in p("key.txt").read_text().splitlines()]
+          primary = [rows[i+1][9] for i, x in enumerate(rows) if x[0] == "pub" and rows[i+1][0] == "fpr"]
+          assert primary == [expected], "Unexpected signing key"
+          sigs = [x.split() for x in p("signature.txt").read_text().splitlines() if x.startswith("[GNUPG:] VALIDSIG ")]
+          assert len(sigs) == 1 and sigs[0][-1] == expected, "Wrong signer"
+          assert sigs[0][9] in {"8", "9", "10", "11"}, "Weak signature hash"
+          m = tomllib.loads(p("manifest.toml").read_text())
+          assert m["pkg"]["rust"]["version"].split()[0] == "1.98.0"
+          a = m["pkg"]["rust"]["target"]["x86_64-unknown-linux-gnu"]
+          assert a["available"] is True
+          u = urllib.parse.urlsplit(a["xz_url"])
+          assert u.scheme == "https" and u.netloc == "static.rust-lang.org"
+          assert re.fullmatch(r"/dist/(?:[0-9]{4}-[0-9]{2}-[0-9]{2}/)?rust-1\.98\.0-x86_64-unknown-linux-gnu\.tar\.xz", u.path)
+          assert not u.query and not u.fragment
+          assert re.fullmatch(r"[0-9a-f]{64}", a["xz_hash"])
+          p("archive-url.txt").write_text(a["xz_url"])
+          p("archive.sha256").write_text(a["xz_hash"] + "  rust.tar.xz\n")
+          PY
+          fetch "$(cat archive-url.txt)" rust.tar.xz
+          clean /usr/bin/sha256sum -c archive.sha256
+          # The signed manifest cryptographically binds the standalone archive.
+          clean /usr/bin/tar -xJf rust.tar.xz
+          test -f rust-1.98.0-x86_64-unknown-linux-gnu/install.sh
+          image='docker.io/library/ubuntu@sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe19e4081cb93a90bf56819d6a'
+          docker pull --platform linux/amd64 "$image"
+          test "$(docker image inspect "$image" --format '{{.Id}}')" = sha256:2b147973fd863c93ced60f325461fe0e262b91317b008e6a2d961f13e81af0e4
+          # Public CA bundle for HTTPS bootstrap; apt still authenticates signed
+          # Ubuntu metadata and verifies all archive hashes. No host home/context.
+          cp /etc/ssl/certs/ca-certificates.crt context/bootstrap-ca.crt
+          cat > context/Dockerfile <<'DOCKERFILE'
+          FROM docker.io/library/ubuntu@sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe19e4081cb93a90bf56819d6a
+          COPY bootstrap-ca.crt /opt/bootstrap-ca.crt
+          RUN set -eux; \
+              mkdir -p /opt/accm-inventory; \
+              rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* /etc/apt/apt.conf.d/docker-clean; \
+              printf '%s\n' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261125T000000Z/ noble main universe' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261125T000000Z/ noble-updates main universe' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261125T000000Z/ noble-security main universe' > /etc/apt/sources.list; \
+              apt-get -o Acquire::https::CaInfo=/opt/bootstrap-ca.crt -o APT::Update::Error-Mode=any update; \
+              sha256sum /var/lib/apt/lists/*InRelease | LC_ALL=C sort > /opt/accm-inventory/apt-release.sha256; \
+              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::https::CaInfo=/opt/bootstrap-ca.crt -y --no-install-recommends --download-only install build-essential pkg-config libssl-dev libsqlite3-dev ca-certificates python3 git perl clang cmake; \
+              (cd /var/cache/apt/archives && sha256sum *.deb | LC_ALL=C sort) > /opt/accm-inventory/deb.sha256; \
+              DEBIAN_FRONTEND=noninteractive apt-get -y --no-install-recommends --no-download install build-essential pkg-config libssl-dev libsqlite3-dev ca-certificates python3 git perl clang cmake; \
+              dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n' | LC_ALL=C sort > /opt/accm-inventory/packages.tsv; \
+              sha256sum /usr/bin/gcc /usr/bin/g++ /usr/bin/ld /usr/bin/ar /usr/bin/pkg-config /usr/bin/clang /usr/bin/cmake /usr/bin/python3 > /opt/accm-inventory/tools.sha256; \
+              chmod -R a+rX /opt/accm-inventory; \
+              rm -f /opt/bootstrap-ca.crt; apt-get clean; rm -rf /var/lib/apt/lists/*
+          DOCKERFILE
+          # Package installation happens only in an ephemeral image build,
+          # before any Rust source/vendor inputs are mounted.
+          docker build --platform linux/amd64 --no-cache --pull=false --tag "$tag" "$root/context"
+          builder="$(docker image inspect "$tag" --format '{{.Id}}')"
+          test "$(docker image inspect "$tag" --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
+          echo "BUILDER_IMAGE_ID=$builder"
+          uid="$(id -u)"
+          gid="$(id -g)"
+          hostnet="$(readlink /proc/self/ns/net)"
+          common=(--rm --pull never --platform linux/amd64 --read-only --cap-drop ALL --security-opt no-new-privileges:true --user "$uid:$gid" --pids-limit 512 --memory 8g --cpus 2 --tmpfs "/tmp:rw,nosuid,nodev,size=512m,mode=1777" --env LC_ALL=C --env TZ=UTC)
+          offline=(--network none --env "EXPECTED_UID=$uid" --env "HOST_NETNS=$hostnet")
+          # Same boundary as successful container preflight; install verified
+          # Rust into a disposable directory, then mount it read-only.
+          docker run "${common[@]}" "${offline[@]}" \
+            --mount "type=bind,source=$root/rust-1.98.0-x86_64-unknown-linux-gnu,target=/input,readonly" \
+            --mount "type=bind,source=$root/tool,target=/toolchain" \
+            --env HOME=/tmp --workdir /tmp --entrypoint /bin/bash "$builder" --noprofile --norc -euc '
+              test "$(id -u)" = "$EXPECTED_UID"
+              test "$(readlink /proc/self/ns/net)" != "$HOST_NETNS"
+              test "$(ls -1 /sys/class/net)" = lo
+              grep -Eq "^CapEff:[[:space:]]+0+$" /proc/self/status
+              grep -Eq "^NoNewPrivs:[[:space:]]+1$" /proc/self/status
+              /bin/bash /input/install.sh --prefix=/toolchain --disable-ldconfig
+              /toolchain/bin/rustc --version --verbose
+              /toolchain/bin/cargo --version
+            '
+          printf '%s\n' '3690cc576ede140504698405d5d8fa3826aaadbe71699c6c4ed0a565d6f493e2  tool/bin/rustc' 'ff3022fcbd13b08434ea7afde9a0ef9d5b3f5c17b5fc7a40031be3ee000a6a24  tool/bin/cargo' | sha256sum -c -
+          # Fetch the exact public upstream commit; no upstream CI is run.
+          commit=1238aae8fc64b212641190a9227c8a734ab1a793
+          tree=ba5c80c1ba7d268cb91e34b153f161646737d9ec
+          gitclean() { clean /usr/bin/env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 /usr/bin/git -c core.hooksPath=/dev/null "$@"; }
+          gitclean init -q "$root/upstream"
+          gitclean -C "$root/upstream" fetch --no-tags --depth=1 https://github.com/bitwarden/sm-action.git "$commit"
+          test "$(gitclean -C "$root/upstream" rev-parse FETCH_HEAD)" = "$commit"
+          test "$(gitclean -C "$root/upstream" rev-parse 'FETCH_HEAD^{tree}')" = "$tree"
+          gitclean -C "$root/upstream" archive "$commit" Cargo.toml Cargo.lock LICENSE src | tar -xf - -C "$root/src"
+          while read -r pin path; do
+            test "$(gitclean hash-object --no-filters "$root/src/$path")" = "$pin"
+          done <<'PINS'
+          570832c893c2eafe6a918329c5510b5810245902 Cargo.toml
+          279d24b39d2978eb3ab5944e6e56f2a8db8428a7 Cargo.lock
+          2ca8921c939df8b53902a93aae162b06562c5ee7 src/main.rs
+          eed4ce7a14f4249be82189f1b2f1df4c6d6e271d src/config.rs
+          08e184384973134e68bad14fe8d1d4ec4af25f72 src/ci.rs
+          e72bfddabc15be5718a7cc061ac10e47741d8219 LICENSE
+          PINS
+          test "$(find "$root/src" -type f | wc -l)" -eq 6
+          # Only Cargo vendoring gets network access; no build scripts, tests,
+          # credentials, CI command files, host socket or private inputs.
+          docker run "${common[@]}" --network bridge \
+            --mount "type=bind,source=$root/tool,target=/toolchain,readonly" \
+            --mount "type=bind,source=$root/src,target=/src,readonly" \
+            --mount "type=bind,source=$root/vendor,target=/vendor" \
+            --env HOME=/tmp --env CARGO_HOME=/tmp/cargo --env RUSTC=/toolchain/bin/rustc \
+            --workdir /src --entrypoint /toolchain/bin/cargo "$builder" vendor --locked --versioned-dirs /vendor > "$root/vendor-config.txt"
+          # Extract only public, fixed-name build inventories from image.
+          docker run "${common[@]}" --network none \
+            --mount "type=bind,source=$root/review,target=/review" --env HOME=/tmp \
+            --entrypoint /bin/bash "$builder" -euc 'cp /opt/accm-inventory/* /review/'
+          # Verify every vendored file, match all package checksums to the
+          # pinned Cargo.lock, and produce canonical evidence for review.
+          clean /usr/bin/python3 - <<'PY'
+          import hashlib, json, pathlib, re, tomllib
+          from pathlib import Path
+          def sha(path):
+              with open(path, "rb") as f:
+                  return hashlib.file_digest(f, "sha256").hexdigest()
+          def canonical(obj):
+              return (json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n").encode()
+          lock = tomllib.loads(Path("src/Cargo.lock").read_text())["package"]
+          expected = {}
+          for pkg in lock:
+              if pkg.get("source") == "registry+https://github.com/rust-lang/crates.io-index":
+                  assert re.fullmatch("[0-9a-f]{64}", pkg["checksum"])
+                  expected[pkg["name"] + "-" + pkg["version"]] = pkg["checksum"]
+              else:
+                  assert pkg["name"] == "sm-action" and "source" not in pkg
+          assert len(lock) == 388 and len(expected) == 387
+          found = {}
+          for directory in sorted(Path("vendor").iterdir()):
+              assert directory.is_dir() and not directory.is_symlink()
+              assert directory.name in expected and directory.name not in found
+              checks = json.loads((directory / ".cargo-checksum.json").read_text())
+              assert checks["package"] == expected[directory.name]
+              actual = {}
+              for p in directory.rglob("*"):
+                  assert not p.is_symlink(), "Unexpected vendored symlink"
+                  if p.is_file():
+                      name = p.relative_to(directory).as_posix()
+                      if name != ".cargo-checksum.json":
+                          actual[name] = sha(p)
+              assert actual == checks["files"], "Vendor file checksum mismatch"
+              manifest = tomllib.loads((directory / "Cargo.toml").read_text())
+              pkg = manifest["package"]
+              assert directory.name == pkg["name"] + "-" + pkg["version"]
+              found[directory.name] = {
+                  "package_checksum": checks["package"],
+                  "tree_sha256": hashlib.sha256(canonical(actual)).hexdigest(),
+                  "build": pkg.get("build", "build.rs" if "build.rs" in actual else False),
+                  "proc_macro": manifest.get("lib", {}).get("proc-macro", False),
+                  "license": pkg.get("license"), "license_file": pkg.get("license-file")
+              }
+          assert set(found) == set(expected)
+          Path("review/crates.json").write_bytes(canonical(found))
+          doc = {
+              "base_manifest": "sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe19e4081cb93a90bf56819d6a",
+              "base_config": "sha256:2b147973fd863c93ced60f325461fe0e262b91317b008e6a2d961f13e81af0e4",
+              "snapshot": "20261125T000000Z",
+              "source_commit": "1238aae8fc64b212641190a9227c8a734ab1a793",
+              "source_tree": "ba5c80c1ba7d268cb91e34b153f161646737d9ec",
+              "target": "x86_64-unknown-linux-gnu",
+              "rust_version": "1.98.0",
+              "rust_manifest_sha256": sha("manifest.toml"),
+              "rust_archive_sha256": sha("rust.tar.xz"),
+              "rustc_sha256": sha("tool/bin/rustc"), "cargo_sha256": sha("tool/bin/cargo"),
+              "lock_sha256": sha("src/Cargo.lock"),
+              "registry_packages": len(found),
+              "inventories": {f.name: sha(f) for f in sorted(Path("review").iterdir())},
+              "release_flags": "-C target-feature=+crt-static",
+              "test_flags": "-C target-feature=-crt-static"
+          }
+          Path("container-build-manifest.json").write_bytes(canonical(doc))
+          PY
+          for f in apt-release.sha256 deb.sha256 packages.tsv tools.sha256 crates.json; do
+            echo "INVENTORY_BEGIN:$f"
+            cat "$root/review/$f"
+            echo "INVENTORY_END:$f"
+          done
+          echo MANIFEST_BEGIN
+          cat "$root/container-build-manifest.json"
+          echo MANIFEST_END
+          manifest_sha="$(sha256sum container-build-manifest.json | cut -d' ' -f1)"
+          echo "CONTAINER_BUILD_MANIFEST_SHA256=$manifest_sha"
+          if [[ "$BUILD_MODE" == inventory ]]; then
+            echo ACCM_CONTAINER_DEPENDENCY_INVENTORY_PASS
+            exit 0
+          fi
+          test "$manifest_sha" = "$REVIEWED_MANIFEST_SHA256"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          fetch "https://raw.githubusercontent.com/Zerefzeolite/axium-accm-integration/$GITHUB_SHA/qualification/APPROVED_CONTAINER_BUILD.json" approved.json
+          cmp -s approved.json container-build-manifest.json
+          # Only the disposable work directory is writable. Source, toolchain,
+          # vendor tree and approved manifest remain read-only in offline build.
+          test "$(df --output=avail -k "$root" | tail -n1)" -ge 6291456
+          docker run "${common[@]}" "${offline[@]}" \
+            --mount "type=bind,source=$root/tool,target=/toolchain,readonly" \
+            --mount "type=bind,source=$root/src,target=/src,readonly" \
+            --mount "type=bind,source=$root/vendor,target=/vendor,readonly" \
+            --mount "type=bind,source=$root/work,target=/work" \
+            --env HOME=/work/home --env CARGO_HOME=/work/cargo --env CARGO_TARGET_DIR=/work/target \
+            --env CARGO_NET_OFFLINE=true --env CARGO_INCREMENTAL=0 --env CARGO_BUILD_JOBS=2 \
+            --env RUSTC=/toolchain/bin/rustc --env RUSTDOC=/toolchain/bin/rustdoc --env PATH=/toolchain/bin:/usr/bin:/bin \
+            --workdir /src --entrypoint /bin/bash "$builder" --noprofile --norc -euc '
+              set -o pipefail
+              test "$(id -u)" = "$EXPECTED_UID" && test "$(id -u)" -ne 0
+              test "$(readlink /proc/self/ns/net)" != "$HOST_NETNS"
+              test "$(ls -1 /sys/class/net)" = lo
+              test "$(wc -l < /proc/net/route)" -eq 1
+              grep -Eq "^CapEff:[[:space:]]+0+$" /proc/self/status
+              grep -Eq "^CapBnd:[[:space:]]+0+$" /proc/self/status
+              grep -Eq "^NoNewPrivs:[[:space:]]+1$" /proc/self/status
+              grep -Eq "^Seccomp:[[:space:]]+2$" /proc/self/status
+              test ! -S /var/run/docker.sock
+              for dir in / /src /vendor /toolchain; do
+                if touch "$dir/.write-probe" 2>/dev/null; then exit 11; fi
+              done
+              if timeout 3 bash -c "echo > /dev/tcp/192.0.2.1/443" 2>/dev/null; then exit 13; fi
+              mkdir -p "$HOME" "$CARGO_HOME"
+              printf "%s\n" "[source.crates-io]" "replace-with = \"vendored-sources\"" "[source.vendored-sources]" "directory = \"/vendor\"" "[net]" "offline = true" > "$CARGO_HOME/config.toml"
+              RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --frozen --target x86_64-unknown-linux-gnu
+              cp /work/target/x86_64-unknown-linux-gnu/release/sm-action /work/candidate
+              sha256sum /work/candidate > /work/binary.sha256
+              RUSTFLAGS="-C target-feature=-crt-static" cargo test --release --frozen --target x86_64-unknown-linux-gnu
+              touch /work/probe-env /work/probe-output
+              version="$(GITHUB_ENV=/work/probe-env GITHUB_OUTPUT=/work/probe-output /work/candidate --version)"
+              test "$version" = 3.0.1
+              test ! -s /work/probe-env && test ! -s /work/probe-output
+              sha256sum -c /work/binary.sha256
+              echo "NATIVE_VERSION=$version"
+              echo "CANDIDATE_BYTES=$(stat -c %s /work/candidate)"
+              echo "CANDIDATE_SHA256=$(cut -d " " -f1 /work/binary.sha256)"
+              echo ACCM_CONTAINER_NATIVE_BUILD_AND_TEST_PASS
+            '
+          echo "BUILD_INPUT_MANIFEST_SHA256=$manifest_sha"
+          echo ACCM_HOSTED_BUILD_CANDIDATE_NOT_ADMITTED

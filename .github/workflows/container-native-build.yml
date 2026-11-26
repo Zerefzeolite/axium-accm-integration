@@ -42,7 +42,7 @@ jobs:
             rm -rf -- "$root"
           }
           trap cleanup EXIT
-          mkdir -m 700 "$root/home" "$root/gnupg" "$root/tmp" "$root/context" "$root/tool" "$root/vendor" "$root/src" "$root/work" "$root/review"
+          mkdir -m 700 "$root/home" "$root/gnupg" "$root/tmp" "$root/context" "$root/tool" "$root/vendor" "$root/src" "$root/work" "$root/review" "$root/registry"
           cd "$root"
           clean() { env -i PATH=/usr/bin:/bin HOME="$root/home" TMPDIR="$root/tmp" LC_ALL=C TZ=UTC "$@"; }
           fetch() {
@@ -157,7 +157,8 @@ jobs:
             --mount "type=bind,source=$root/tool,target=/toolchain,readonly" \
             --mount "type=bind,source=$root/src,target=/src,readonly" \
             --mount "type=bind,source=$root/vendor,target=/vendor" \
-            --env HOME=/tmp --env CARGO_HOME=/tmp/cargo --env RUSTC=/toolchain/bin/rustc \
+            --mount "type=bind,source=$root/registry,target=/cargo-home" \
+            --env HOME=/tmp --env CARGO_HOME=/cargo-home --env RUSTC=/toolchain/bin/rustc \
             --workdir /src --entrypoint /toolchain/bin/cargo "$builder" vendor --locked --versioned-dirs /vendor > "$root/vendor-config.txt"
           # Extract only public, fixed-name build inventories from image.
           docker run "${common[@]}" --network none \
@@ -229,7 +230,11 @@ jobs:
           PY
           for f in apt-release.sha256 deb.sha256 packages.tsv tools.sha256 crates.json; do
             echo "INVENTORY_BEGIN:$f"
-            cat "$root/review/$f"
+            if [[ "$f" == crates.json ]]; then
+              clean /usr/bin/python3 -m json.tool "$root/review/$f"
+            else
+              cat "$root/review/$f"
+            fi
             echo "INVENTORY_END:$f"
           done
           echo MANIFEST_BEGIN
@@ -245,8 +250,8 @@ jobs:
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
           fetch "https://raw.githubusercontent.com/Zerefzeolite/axium-accm-integration/$GITHUB_SHA/qualification/APPROVED_CONTAINER_BUILD.json" approved.json
           cmp -s approved.json container-build-manifest.json
-          # Only the disposable work directory is writable. Source, toolchain,
-          # vendor tree and approved manifest remain read-only in offline build.
+          # Only the disposable work directory and container tmpfs are writable.
+          # Source, toolchain and vendor tree remain read-only in offline build.
           test "$(df --output=avail -k "$root" | tail -n1)" -ge 6291456
           docker run "${common[@]}" "${offline[@]}" \
             --mount "type=bind,source=$root/tool,target=/toolchain,readonly" \

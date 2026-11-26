@@ -1,0 +1,114 @@
+name: ACCM isolated container preflight
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: accm-public-source-qualification
+  cancel-in-progress: false
+jobs:
+  probe:
+    if: github.repository == 'Zerefzeolite/axium-accm-integration' && github.repository_id == '1472823260' && github.actor_id == '9297681' && github.ref == 'refs/heads/main' && github.run_attempt == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Verify Rust archive and offline non-root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(id -u)" -ne 0
+          test "$(uname -m)" = x86_64
+          root="$(mktemp -d)"
+          cid=""
+          trap 'if [[ -n "$cid" ]]; then docker rm -f "$cid" >/dev/null 2>&1 || true; fi; rm -rf -- "$root"' EXIT
+          mkdir -m 700 "$root/home" "$root/gnupg" "$root/tmp"
+          cd "$root"
+          clean() { env -i PATH=/usr/bin:/bin HOME="$root/home" TMPDIR="$root/tmp" LC_ALL=C TZ=UTC "$@"; }
+          fetch() {
+            clean /usr/bin/curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 20 --max-time 600 --output "$2" "$1"
+          }
+          fetch https://static.rust-lang.org/rust-key.gpg.ascii rust-key.asc
+          fetch https://static.rust-lang.org/dist/channel-rust-1.98.0.toml manifest.toml
+          fetch https://static.rust-lang.org/dist/channel-rust-1.98.0.toml.asc manifest.asc
+          clean /usr/bin/gpg --homedir "$root/gnupg" --batch --import rust-key.asc
+          clean /usr/bin/gpg --homedir "$root/gnupg" --batch --with-colons --list-keys > key.txt
+          clean /usr/bin/gpg --homedir "$root/gnupg" --batch --status-fd 1 --verify manifest.asc manifest.toml > signature.txt
+          clean /usr/bin/python3 - <<'PY'
+          import pathlib, re, tomllib, urllib.parse
+          p = pathlib.Path
+          expected = "108F66205EAEB0AAA8DD5E1C85AB96E6FA1BE5FE"
+          rows = [x.split(":") for x in p("key.txt").read_text().splitlines()]
+          primary = [rows[i+1][9] for i, x in enumerate(rows) if x[0] == "pub" and rows[i+1][0] == "fpr"]
+          assert primary == [expected], "Unexpected signing key"
+          sigs = [x.split() for x in p("signature.txt").read_text().splitlines() if x.startswith("[GNUPG:] VALIDSIG ")]
+          assert len(sigs) == 1 and sigs[0][-1] == expected, "Wrong signer"
+          assert sigs[0][9] in {"8", "9", "10", "11"}, "Weak signature hash"
+          m = tomllib.loads(p("manifest.toml").read_text())
+          assert m["pkg"]["rust"]["version"].split()[0] == "1.98.0"
+          a = m["pkg"]["rust"]["target"]["x86_64-unknown-linux-gnu"]
+          assert a["available"] is True
+          u = urllib.parse.urlsplit(a["xz_url"])
+          assert u.scheme == "https" and u.netloc == "static.rust-lang.org"
+          assert re.fullmatch(r"/dist/(?:[0-9]{4}-[0-9]{2}-[0-9]{2}/)?rust-1\.98\.0-x86_64-unknown-linux-gnu\.tar\.xz", u.path)
+          assert not u.query and not u.fragment
+          assert re.fullmatch(r"[0-9a-f]{64}", a["xz_hash"])
+          p("archive-url.txt").write_text(a["xz_url"])
+          p("archive.sha256").write_text(a["xz_hash"] + "  rust.tar.xz\n")
+          PY
+          fetch "$(cat archive-url.txt)" rust.tar.xz
+          clean /usr/bin/sha256sum -c archive.sha256
+          # The signed manifest cryptographically binds the standalone archive.
+          clean /usr/bin/tar -xJf rust.tar.xz
+          test -f rust-1.98.0-x86_64-unknown-linux-gnu/install.sh
+          image='docker.io/library/ubuntu@sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe19e4081cb93a90bf56819d6a'
+          docker version --format '{{.Server.Version}}'
+          docker pull --platform linux/amd64 "$image"
+          docker image inspect "$image" --format '{{.Id}} {{.Os}}/{{.Architecture}} {{json .RepoDigests}}'
+          test "$(docker image inspect "$image" --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
+          uid="$(id -u)"
+          gid="$(id -g)"
+          hostnet="$(readlink /proc/self/ns/net)"
+          # Only the verified distribution directory enters the container.
+          # No runner checkout, home, Docker socket, tokens, or provider data.
+          cid="$(docker create --pull never --platform linux/amd64 --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --user "$uid:$gid" --pids-limit 256 --memory 8g --cpus 2 --tmpfs "/work:rw,nosuid,nodev,size=4g,uid=$uid,gid=$gid,mode=0700" --tmpfs "/tmp:rw,nosuid,nodev,size=256m,mode=1777" --mount "type=bind,source=$root/rust-1.98.0-x86_64-unknown-linux-gnu,target=/input,readonly" --env "EXPECTED_UID=$uid" --env "HOST_NETNS=$hostnet" --env HOME=/work --env LC_ALL=C --env TZ=UTC --workdir /work --entrypoint /bin/bash "$image" --noprofile --norc -euc '
+            test "$(id -u)" = "$EXPECTED_UID"
+            test "$(id -u)" -ne 0
+            test "$(readlink /proc/self/ns/net)" != "$HOST_NETNS"
+            test "$(ls -1 /sys/class/net)" = lo
+            test "$(wc -l < /proc/net/route)" -eq 1
+            grep -Eq "^CapEff:[[:space:]]+0+$" /proc/self/status
+            grep -Eq "^CapBnd:[[:space:]]+0+$" /proc/self/status
+            grep -Eq "^NoNewPrivs:[[:space:]]+1$" /proc/self/status
+            grep -Eq "^Seccomp:[[:space:]]+2$" /proc/self/status
+            test ! -S /var/run/docker.sock
+            if touch /input/.write-probe 2>/dev/null; then exit 11; fi
+            if touch /.write-probe 2>/dev/null; then exit 12; fi
+            if timeout 3 bash -c "echo > /dev/tcp/192.0.2.1/443" 2>/dev/null; then exit 13; fi
+            echo ACCM_CONTAINER_ISOLATION_PASS
+            /bin/bash /input/install.sh --prefix=/work/toolchain --disable-ldconfig
+            /work/toolchain/bin/rustc --version --verbose | tee rustc.txt
+            /work/toolchain/bin/cargo --version | tee cargo.txt
+            grep -q "^rustc 1\.98\.0 " rustc.txt
+            grep -q "^host: x86_64-unknown-linux-gnu$" rustc.txt
+            grep -q "^cargo 1\.98\.0 " cargo.txt
+            sha256sum /work/toolchain/bin/rustc /work/toolchain/bin/cargo
+            echo ACCM_CONTAINER_RUST_PREFLIGHT_PASS
+          ')"
+          docker inspect "$cid" | clean /usr/bin/python3 -c '
+          import json,sys
+          x=json.load(sys.stdin)[0]; h=x["HostConfig"]
+          assert h["NetworkMode"]=="none" and h["ReadonlyRootfs"]
+          assert not h["Privileged"] and h["CapDrop"]==["ALL"]
+          assert "no-new-privileges:true" in h["SecurityOpt"]
+          assert x["Config"]["User"].split(":")[0]!="0"
+          assert not h.get("CapAdd") and not h.get("Devices")
+          assert h.get("PidMode") not in ("host",)
+          assert h.get("IpcMode") not in ("host",)
+          m=[m for m in x["Mounts"] if m["Type"]=="bind"]
+          assert len(m)==1 and m[0]["Destination"]=="/input" and not m[0]["RW"]
+          assert not any(m["Destination"]=="/var/run/docker.sock" for m in x["Mounts"])
+          print("ACCM_CONTAINER_CONFIG_PASS")
+          '
+          docker start -a "$cid"
+          test "$(docker inspect "$cid" --format '{{.State.ExitCode}}')" = 0
+          echo ACCM_HOSTED_CONTAINER_PREFLIGHT_PASS

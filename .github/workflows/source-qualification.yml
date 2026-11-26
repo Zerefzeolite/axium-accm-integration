@@ -108,6 +108,8 @@ jobs:
           def tree(path):
               out = {}
               for f in sorted(p(path).rglob("*")):
+                  if f.relative_to(path).as_posix() == "lib/rustlib/install.log":
+                      continue  # Installer log may embed the temporary prefix.
                   if f.is_symlink():
                       out[str(f.relative_to(path))] = "symlink:" + str(f.readlink())
                   elif f.is_file():
@@ -137,8 +139,12 @@ jobs:
             exit 0
           fi
           test "$manifest_sha" = "$REVIEWED_MANIFEST_SHA256"
-          # Read exact source from the reviewed main commit, not a moving branch.
+          # A dispatch input is not authority: require the exact reviewed manifest
+          # to have been admitted through the protected main branch.
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          fetch "https://raw.githubusercontent.com/Zerefzeolite/axium-accm-integration/$GITHUB_SHA/qualification/APPROVED_HOSTED_ENVIRONMENT.json" approved.json
+          test "$(sha256sum approved.json | cut -d' ' -f1)" = "$manifest_sha"
+          cmp -s approved.json environment.json
           fetch "https://raw.githubusercontent.com/Zerefzeolite/axium-accm-integration/$GITHUB_SHA/qualification/build_candidate.py" build_candidate.py
           test "$(clean /usr/bin/git hash-object --no-filters build_candidate.py)" = 863cd025ada375c57704272cc4a9afd21db2785a
           rustc_sha="$(sha256sum "$rustc" | cut -d' ' -f1)"

@@ -1,0 +1,42 @@
+name: Synthetic connectivity qualification
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: synthetic-qualification
+  cancel-in-progress: false
+jobs:
+  qualify:
+    if: github.repository == 'Zerefzeolite/axium-accm-integration' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == github.repository_owner && github.run_attempt == 1 && github.sha == vars.APPROVED_SHA
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    environment: synthetic-qualification
+    steps:
+      - name: Validate the synthetic fixture identifier
+        id: fixture
+        shell: bash
+        env:
+          FIXTURE_UUID: ${{ vars.SYNTHETIC_FIXTURE_UUID }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$FIXTURE_UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            printf '%s\n' 'INVALID_SYNTHETIC_FIXTURE_ID' >&2
+            exit 1
+          fi
+          printf 'id=%s\n' "$FIXTURE_UUID" >> "$GITHUB_OUTPUT"
+      - name: Retrieve the disposable synthetic fixture
+        uses: bitwarden/sm-action@f1de238fc00c738c56140796018be9084c2b5d21
+        with:
+          access_token: ${{ secrets.SYNTHETIC_BW_ACCESS_TOKEN }}
+          cloud_region: us
+          secrets: |
+            ${{ steps.fixture.outputs.id }} > SYNTHETIC_FIXTURE
+      - name: Compare the public synthetic marker without printing retrieved data
+        shell: bash
+        run: |
+          set +x
+          if [[ "${SYNTHETIC_FIXTURE:-}" != 'ACCM_SYNTHETIC_CONNECTIVITY_V1' ]]; then
+            printf '%s\n' 'SYNTHETIC_MISMATCH' >&2
+            exit 1
+          fi
+          printf '%s\n' 'SYNTHETIC_CONNECTIVITY_PASS'

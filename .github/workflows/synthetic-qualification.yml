@@ -44,28 +44,36 @@ jobs:
           chmod 0500 "$bin"
           test "$("$bin" --version)" = 3.0.1
           printf 'path=%s\n' "$bin" >> "$GITHUB_OUTPUT"
-      - name: Read and compare only the disposable synthetic marker
+      - name: Compare disposable synthetic marker with isolated output
         shell: bash
         env:
           VERIFIED_BIN: ${{ steps.dependency.outputs.path }}
-          FIXTURE_UUID: ${{ vars.SYNTHETIC_FIXTURE_UUID }}
+          FIXTURE_UUID: ${{ secrets.SYNTHETIC_FIXTURE_UUID }}
           INPUT_ACCESS_TOKEN: ${{ secrets.SYNTHETIC_BW_ACCESS_TOKEN }}
         run: |
           set -euo pipefail
           set +x
+          umask 077
           [[ -z "${RUNNER_DEBUG+x}" && -z "${ACTIONS_RUNNER_DEBUG+x}" ]] || { printf '%s\n' 'DEBUG_NOT_ALLOWED' >&2; exit 1; }
           [[ "$FIXTURE_UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || { printf '%s\n' 'INVALID_SYNTHETIC_FIXTURE_ID' >&2; exit 1; }
           [[ -n "$INPUT_ACCESS_TOKEN" ]] || { printf '%s\n' 'SYNTHETIC_TOKEN_NOT_CONFIGURED' >&2; exit 1; }
           printf '%s  %s\n' 'fa998e9db775d5c7bdbc0fd8840ac6474a8348cdc989176c5ce24c3d09045752' "$VERIFIED_BIN" | sha256sum --check --status
-          export INPUT_SECRETS="$FIXTURE_UUID > SYNTHETIC_FIXTURE" INPUT_CLOUD_REGION=us INPUT_SET_ENV=true
+          dir="$(mktemp -d "$RUNNER_TEMP/accm-marker.XXXXXX")"
+          trap 'rm -rf -- "$dir"' EXIT
+          : > "$dir/env"
+          : > "$dir/output"
+          export INPUT_SECRETS="$FIXTURE_UUID > SYNTHETIC_FIXTURE" INPUT_CLOUD_REGION=us INPUT_SET_ENV=false
           unset INPUT_BASE_URL INPUT_API_URL INPUT_IDENTITY_URL
-          "$VERIFIED_BIN" || { printf '%s\n' 'SYNTHETIC_PROVIDER_FAILURE' >&2; exit 1; }
-      - name: Verify synthetic marker without displaying it
-        shell: bash
-        run: |
-          set +x
-          if [[ "${SYNTHETIC_FIXTURE:-}" != 'ACCM_SYNTHETIC_CONNECTIVITY_V1' ]]; then
-            printf '%s\n' 'SYNTHETIC_MISMATCH' >&2
+          if ! GITHUB_ENV="$dir/env" GITHUB_OUTPUT="$dir/output" "$VERIFIED_BIN" >/dev/null 2>&1; then
+            printf '%s\n' 'SYNTHETIC_PROVIDER_FAILURE' >&2
             exit 1
           fi
+          unset INPUT_ACCESS_TOKEN INPUT_SECRETS FIXTURE_UUID
+          [[ ! -s "$dir/env" ]] || { printf '%s\n' 'UNEXPECTED_ENV_OUTPUT' >&2; exit 1; }
+          mapfile -t result < "$dir/output"
+          [[ ${#result[@]} -eq 3 ]] || { printf '%s\n' 'SYNTHETIC_OUTPUT_SHAPE_FAILURE' >&2; exit 1; }
+          prefix='SYNTHETIC_FIXTURE<<'
+          delimiter="${result[0]#"$prefix"}"
+          [[ "${result[0]}" == "$prefix$delimiter" && "$delimiter" =~ ^ghadelimiter_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || { printf '%s\n' 'SYNTHETIC_OUTPUT_FORMAT_FAILURE' >&2; exit 1; }
+          [[ "${result[1]}" == 'ACCM_SYNTHETIC_CONNECTIVITY_V1' && "${result[2]}" == "$delimiter" ]] || { printf '%s\n' 'SYNTHETIC_MISMATCH' >&2; exit 1; }
           printf '%s\n' 'SYNTHETIC_CONNECTIVITY_PASS'

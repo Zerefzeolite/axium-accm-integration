@@ -34,10 +34,19 @@ jobs:
           case "$BUILD_MODE" in inventory|build) ;; *) exit 2;; esac
           if [[ "$BUILD_MODE" == build ]]; then
             [[ "$REVIEWED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+            # One native build opportunity for this exact workflow lineage.
+            test "$GITHUB_RUN_NUMBER" = 4
+            test "$GITHUB_RUN_ATTEMPT" = 1
+            test "$GITHUB_REF_PROTECTED" = true
+            test "$GITHUB_WORKFLOW_REF" = 'Zerefzeolite/axium-accm-integration/.github/workflows/container-native-build.yml@refs/heads/main'
+            test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
           fi
           root="$(mktemp -d)"
           tag="accm-builder:$GITHUB_RUN_ID"
+          release_name="accm-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test_name="accm-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           cleanup() {
+            docker rm -f "$release_name" "$test_name" >/dev/null 2>&1 || true
             docker image rm "$tag" >/dev/null 2>&1 || true
             rm -rf -- "$root"
           }
@@ -256,7 +265,135 @@ jobs:
           # Only the disposable work directory and container tmpfs are writable.
           # Source, toolchain and vendor tree remain read-only in offline build.
           test "$(df --output=avail -k "$root" | tail -n1)" -ge 6291456
-          docker run "${common[@]}" "${offline[@]}" \
+          # Capture child diagnostics with an enforced byte ceiling, no daemon log
+          # spool, and delimiter-free encoding. Host emits only fixed markers and
+          # encoded preview; never replay arbitrary child text directly.
+          cat > "$root/capture.py" <<'CAPTURE_PY'
+          import os, pathlib, stat, struct, hashlib, subprocess, sys, tempfile
+          
+          LIMIT = 16 * 1024 * 1024
+          PREVIEW = 512 * 1024
+          
+          def encode(data):
+              # Escape every delimiter byte, percent, control and non-ASCII byte.
+              return "".join(chr(b) if 32 <= b < 127 and b not in (35, 37, 58)
+                             else "%%%02X" % b for b in data)
+          
+          def capture(argv, path, limit, cancel):
+              total = 0
+              with open(path, "xb") as out:
+                  p = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, bufsize=0)
+                  try:
+                      while True:
+                          data = p.stdout.read(65536)
+                          if not data:
+                              break
+                          if len(data) > limit - total:
+                              cancel()
+                              return 125
+                          out.write(data)
+                          total += len(data)
+                      return p.wait()
+                  finally:
+                      if p.poll() is None:
+                          p.kill()
+                      p.wait()
+                      p.stdout.close()
+          
+          def replay(path):
+              size = path.stat().st_size
+              assert size <= LIMIT
+              with path.open("rb") as f:
+                  first = f.read(PREVIEW)
+                  if size > 2 * PREVIEW:
+                      f.seek(-PREVIEW, os.SEEK_END)
+                      tail = f.read(PREVIEW)
+                      parts = [first, tail]
+                  else:
+                      parts = [first + f.read(PREVIEW)]
+              print("ACCM_CAPTURE_BYTES=" + str(size))
+              for idx, part in enumerate(parts):
+                  if idx:
+                      print("ACCM_CAPTURE_MIDDLE_OMITTED")
+                  for line in part.split(b"\n"):
+                      for offset in range(0, max(1, len(line)), 4096):
+                          safe = encode(line[offset:offset + 4096])
+                          assert "::" not in safe and "##[" not in safe
+                          print("BUILD | " + safe)
+          
+          def selftest():
+              payload = bytes(range(256)) + b"::::::##[::" + b"x" * 20000
+              safe = encode(payload)
+              assert "::" not in safe and "##[" not in safe
+              assert "\r" not in safe and "\n" not in safe
+              from urllib.parse import unquote_to_bytes
+              assert unquote_to_bytes(safe) == payload
+              with tempfile.TemporaryDirectory() as tmp:
+                  root = pathlib.Path(tmp)
+                  p = root / "ok"
+                  assert capture([sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'ok\\n')"], p, 64, lambda: None) == 0
+                  assert p.read_bytes() == b"ok\n"
+                  p = root / "overflow"
+                  cancelled = []
+                  assert capture([sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x'*8192)"],
+                                 p, 1024, lambda: cancelled.append(True)) == 125
+                  assert cancelled == [True] and p.stat().st_size <= 1024
+                  p = root / "replay"
+                  p.write_bytes(payload + b"\n" + b":::##[::\r\x1b")
+                  from contextlib import redirect_stdout
+                  from io import StringIO
+                  out = StringIO()
+                  with redirect_stdout(out):
+                      replay(p)
+                  lines = out.getvalue().splitlines()
+                  assert lines[0].startswith("ACCM_CAPTURE_BYTES=")
+                  assert all(line.startswith("BUILD | ") for line in lines[1:])
+                  assert all("::" not in line and "##[" not in line for line in lines)
+                  assert all(len(line) <= 8 + 4096 * 3 for line in lines[1:])
+                  p = root / "failure"
+                  assert capture([sys.executable, "-c", "import sys; sys.exit(7)"],
+                                 p, 64, lambda: None) == 7
+              print("ACCM_CAPTURE_SELFTEST_PASS")
+          
+          def seal(source, target):
+              # Container has stopped. Only a regular, single-link bounded ELF may cross.
+              fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+              with os.fdopen(fd, "rb") as f:
+                  s = os.fstat(f.fileno())
+                  assert stat.S_ISREG(s.st_mode) and s.st_nlink == 1
+                  assert 64 <= s.st_size <= 64 * 1024 * 1024
+                  data = f.read(64 * 1024 * 1024 + 1)
+                  assert len(data) == s.st_size
+              assert data[:6] == b"\x7fELF\x02\x01" and struct.unpack_from("<H", data, 18)[0] == 62
+              with open(target, "xb") as f:
+                  f.write(data)
+              os.chmod(target, 0o555)
+              print("CANDIDATE_BYTES=" + str(len(data)))
+              print("CANDIDATE_SHA256=" + hashlib.sha256(data).hexdigest())
+          
+          if __name__ == "__main__":
+              if sys.argv[1:] == ["--selftest"]:
+                  selftest()
+              elif sys.argv[1] == "--seal":
+                  seal(sys.argv[2], sys.argv[3])
+              else:
+                  path, name = pathlib.Path(sys.argv[1]), sys.argv[2]
+                  def cancel():
+                      try:
+                          subprocess.run(["/usr/bin/docker", "rm", "-f", name],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                         timeout=15, check=False)
+                      except (OSError, subprocess.TimeoutExpired):
+                          pass
+                  result = capture(sys.argv[3:], path, LIMIT, cancel)
+                  replay(path)
+                  if result == 125:
+                      print("ACCM_CAPTURE_OVERFLOW_OR_EXIT125")
+                  sys.exit(result if 0 <= result <= 255 else 1)
+          CAPTURE_PY
+          clean /usr/bin/python3 "$root/capture.py" --selftest
+          clean /usr/bin/python3 "$root/capture.py" "$root/release.log" "$release_name" /usr/bin/docker run "${common[@]}" "${offline[@]}" --name "$release_name" --log-driver none \
             --mount "type=bind,source=$root/tool,target=/toolchain,readonly" \
             --mount "type=bind,source=$root/src,target=/src,readonly" \
             --mount "type=bind,source=$root/vendor,target=/vendor,readonly" \
@@ -281,19 +418,55 @@ jobs:
               if timeout 3 bash -c "echo > /dev/tcp/192.0.2.1/443" 2>/dev/null; then exit 13; fi
               mkdir -p "$HOME" "$CARGO_HOME"
               printf "%s\n" "[source.crates-io]" "replace-with = \"vendored-sources\"" "[source.vendored-sources]" "directory = \"/vendor\"" "[net]" "offline = true" > "$CARGO_HOME/config.toml"
+              echo ACCM_LINUX_FEATURE_GRAPH_BEGIN
+              cargo tree --frozen --target x86_64-unknown-linux-gnu --edges normal,build,dev,features --prefix depth --charset ascii
+              echo ACCM_LINUX_FEATURE_GRAPH_END
               RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --frozen --target x86_64-unknown-linux-gnu
               cp /work/target/x86_64-unknown-linux-gnu/release/sm-action /work/candidate
-              sha256sum /work/candidate > /work/binary.sha256
+            '
+          # Seal only the resulting executable after the release container exits.
+          clean /usr/bin/python3 "$root/capture.py" --seal "$root/work/candidate" "$root/sealed-candidate"
+          sha256sum "$root/sealed-candidate" > "$root/host-candidate.sha256"
+          rm -rf -- "$root/work"
+          mkdir -m 700 "$root/test-work"
+          test "$(df --output=avail -k "$root" | tail -n1)" -ge 6291456
+          clean /usr/bin/python3 "$root/capture.py" "$root/test.log" "$test_name" /usr/bin/docker run "${common[@]}" "${offline[@]}" --name "$test_name" --log-driver none \
+            --mount "type=bind,source=$root/tool,target=/toolchain,readonly" \
+            --mount "type=bind,source=$root/src,target=/src,readonly" \
+            --mount "type=bind,source=$root/vendor,target=/vendor,readonly" \
+            --mount "type=bind,source=$root/test-work,target=/work" \
+            --mount "type=bind,source=$root/sealed-candidate,target=/candidate,readonly" \
+            --env HOME=/work/home --env CARGO_HOME=/work/cargo --env CARGO_TARGET_DIR=/work/target \
+            --env CARGO_NET_OFFLINE=true --env CARGO_INCREMENTAL=0 --env CARGO_BUILD_JOBS=2 \
+            --env RUSTC=/toolchain/bin/rustc --env RUSTDOC=/toolchain/bin/rustdoc --env PATH=/toolchain/bin:/usr/bin:/bin \
+            --workdir /src --entrypoint /bin/bash "$builder" --noprofile --norc -euc '
+              set -o pipefail
+              test "$(id -u)" = "$EXPECTED_UID" && test "$(id -u)" -ne 0
+              test "$(readlink /proc/self/ns/net)" != "$HOST_NETNS"
+              test "$(ls -1 /sys/class/net)" = lo
+              test "$(wc -l < /proc/net/route)" -eq 1
+              grep -Eq "^CapEff:[[:space:]]+0+$" /proc/self/status
+              grep -Eq "^CapBnd:[[:space:]]+0+$" /proc/self/status
+              grep -Eq "^NoNewPrivs:[[:space:]]+1$" /proc/self/status
+              grep -Eq "^Seccomp:[[:space:]]+2$" /proc/self/status
+              test ! -S /var/run/docker.sock
+              for dir in / /src /vendor /toolchain; do
+                if touch "$dir/.write-probe" 2>/dev/null; then exit 11; fi
+              done
+              if timeout 3 bash -c "echo > /dev/tcp/192.0.2.1/443" 2>/dev/null; then exit 13; fi
+              mkdir -p "$HOME" "$CARGO_HOME"
+              printf "%s\n" "[source.crates-io]" "replace-with = \"vendored-sources\"" "[source.vendored-sources]" "directory = \"/vendor\"" "[net]" "offline = true" > "$CARGO_HOME/config.toml"
+              test -f /candidate && test -x /candidate
+              if touch /candidate 2>/dev/null; then exit 11; fi
               RUSTFLAGS="-C target-feature=-crt-static" cargo test --release --frozen --target x86_64-unknown-linux-gnu
+              test ! -e /work/probe-env && test ! -e /work/probe-output
               touch /work/probe-env /work/probe-output
-              version="$(GITHUB_ENV=/work/probe-env GITHUB_OUTPUT=/work/probe-output /work/candidate --version)"
+              version="$(GITHUB_ENV=/work/probe-env GITHUB_OUTPUT=/work/probe-output /candidate --version)"
               test "$version" = 3.0.1
               test ! -s /work/probe-env && test ! -s /work/probe-output
-              sha256sum -c /work/binary.sha256
-              echo "NATIVE_VERSION=$version"
-              echo "CANDIDATE_BYTES=$(stat -c %s /work/candidate)"
-              echo "CANDIDATE_SHA256=$(cut -d " " -f1 /work/binary.sha256)"
-              echo ACCM_CONTAINER_NATIVE_BUILD_AND_TEST_PASS
             '
+          sha256sum -c "$root/host-candidate.sha256"
+          echo NATIVE_VERSION=3.0.1
+          echo ACCM_CONTAINER_NATIVE_BUILD_AND_TEST_PASS
           echo "BUILD_INPUT_MANIFEST_SHA256=$manifest_sha"
           echo ACCM_HOSTED_BUILD_CANDIDATE_NOT_ADMITTED

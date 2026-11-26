@@ -332,7 +332,7 @@ jobs:
               with tempfile.TemporaryDirectory() as tmp:
                   root = pathlib.Path(tmp)
                   p = root / "ok"
-                  assert capture([sys.executable, "-c", "print('ok')"], p, 64, lambda: None) == 0
+                  assert capture([sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'ok\\n')"], p, 64, lambda: None) == 0
                   assert p.read_bytes() == b"ok\n"
                   p = root / "overflow"
                   cancelled = []

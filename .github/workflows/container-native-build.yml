@@ -96,11 +96,11 @@ jobs:
               printf '%s\n' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261125T000000Z/ noble main universe' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261125T000000Z/ noble-updates main universe' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261125T000000Z/ noble-security main universe' > /etc/apt/sources.list; \
               apt-get -o Acquire::https::CaInfo=/opt/bootstrap-ca.crt -o APT::Update::Error-Mode=any update; \
               sha256sum /var/lib/apt/lists/*InRelease | LC_ALL=C sort > /opt/accm-inventory/apt-release.sha256; \
-              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::https::CaInfo=/opt/bootstrap-ca.crt -y --no-install-recommends --download-only install build-essential pkg-config libssl-dev libsqlite3-dev ca-certificates python3 git perl clang cmake; \
+              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::https::CaInfo=/opt/bootstrap-ca.crt -y --no-install-recommends --download-only install build-essential pkg-config libssl-dev libsqlite3-dev ca-certificates python3 git perl; \
               (cd /var/cache/apt/archives && sha256sum *.deb | LC_ALL=C sort) > /opt/accm-inventory/deb.sha256; \
-              DEBIAN_FRONTEND=noninteractive apt-get -y --no-install-recommends --no-download install build-essential pkg-config libssl-dev libsqlite3-dev ca-certificates python3 git perl clang cmake; \
+              DEBIAN_FRONTEND=noninteractive apt-get -y --no-install-recommends --no-download install build-essential pkg-config libssl-dev libsqlite3-dev ca-certificates python3 git perl; \
               dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n' | LC_ALL=C sort > /opt/accm-inventory/packages.tsv; \
-              sha256sum /usr/bin/gcc /usr/bin/g++ /usr/bin/ld /usr/bin/ar /usr/bin/pkg-config /usr/bin/clang /usr/bin/cmake /usr/bin/python3 > /opt/accm-inventory/tools.sha256; \
+              sha256sum /usr/bin/gcc /usr/bin/g++ /usr/bin/ld /usr/bin/ar /usr/bin/pkg-config /usr/bin/python3 > /opt/accm-inventory/tools.sha256; \
               chmod -R a+rX /opt/accm-inventory; \
               rm -f /opt/bootstrap-ca.crt; apt-get clean; rm -rf /var/lib/apt/lists/*
           DOCKERFILE

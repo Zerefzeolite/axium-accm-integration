@@ -1,6 +1,6 @@
 # Credential-free pinned-source build candidate
 
-Status: draft for independent technical review; not an executable GitHub workflow, not admitted to credential use.
+Status: draft for independent technical review; includes a manual hosted workflow candidate; not merged or admitted to credential use.
 
 ## Exact source and proposed toolchain
 
@@ -26,6 +26,12 @@ Status: draft for independent technical review; not an executable GitHub workflo
 
 The original publisher's release remains held for provenance. A matching new digest would be useful evidence; a different digest does not automatically disqualify a separately reviewed new binary. Neither result alone is a release approval.
 
-A separately reviewed public build-only attestation lane may be proposed using a pinned and specifically allowlisted attestation action, a restricted OIDC signing job with no provider credentials, and digest/identity verification. No such workflow, artifact upload, Actions settings change, attestation, or executable publication is included here. The current synthetic-qualification workflow and SECURITY.md remain untouched. Any later publication needs a separate license and authority review.
+A separately reviewed public build-only attestation lane may be proposed using a pinned and specifically allowlisted attestation action, a restricted OIDC signing job with no provider credentials, and digest/identity verification. No attestation workflow, artifact upload, Actions settings change, attestation, or executable publication is included here. The current synthetic-qualification workflow and SECURITY.md remain untouched. Any later publication needs a separate license and authority review.
 
 No new credential-bearing run or consumer is authorized by this draft. Effective single-fixture provider isolation, genuinely independent human acceptance, durable one-use dispatch and existing synthetic cleanup controls remain separate prerequisites. Never attach or log tokens, private project details or actual credential identifiers in a public build.
+
+## Hosted Ubuntu qualification lane
+
+The new source-qualification.yml is manual-dispatch only, repository/owner/main/first-attempt restricted, standard ubuntu-24.04, token permissions empty, no external Actions or provider secrets, no artifact publication. It verifies the official Rust 1.98.0 channel manifest against the pinned Rust signing-key fingerprint and strong digest algorithm, then verifies the archive and uses a disposable isolated prefix. The runner image label is not immutable; the preflight records image version, OS, kernel, package inventory, tool hashes, toolchain tree, and a native network-namespace probe. Installation logs are excluded from the toolchain tree digest because they can contain random paths. This is a measured environment, not proof of every system library byte or full process isolation. No weakening of host AppArmor/user-namespace restrictions is permitted. The preflight does not build or authenticate.
+
+Build mode additionally requires the exact preflight environment JSON to be independently reviewed and committed as qualification/APPROVED_HOSTED_ENVIRONMENT.json on protected main, with matching dispatch digest. That file is intentionally absent in this candidate. The exact build script blob is pinned. Hosted image or toolchain drift fails closed; if host image churn or nondeterminism prevents stable qualification, revise the runner approach under separate review rather than relax the match. Successful build logs provide a digest/version/test receipt, not a retained artifact or signed provenance. Candidate binaries and temporary files are not published; retention and attestation require a separately reviewed lane. Neither the approved JSON nor owner dispatch alone constitutes an independent acceptance record.

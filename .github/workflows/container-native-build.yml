@@ -339,6 +339,21 @@ jobs:
                   assert capture([sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x'*8192)"],
                                  p, 1024, lambda: cancelled.append(True)) == 125
                   assert cancelled == [True] and p.stat().st_size <= 1024
+                  p = root / "replay"
+                  p.write_bytes(payload + b"\n" + b":::##[::\r\x1b")
+                  from contextlib import redirect_stdout
+                  from io import StringIO
+                  out = StringIO()
+                  with redirect_stdout(out):
+                      replay(p)
+                  lines = out.getvalue().splitlines()
+                  assert lines[0].startswith("ACCM_CAPTURE_BYTES=")
+                  assert all(line.startswith("BUILD | ") for line in lines[1:])
+                  assert all("::" not in line and "##[" not in line for line in lines)
+                  assert all(len(line) <= 8 + 4096 * 3 for line in lines[1:])
+                  p = root / "failure"
+                  assert capture([sys.executable, "-c", "import sys; sys.exit(7)"],
+                                 p, 64, lambda: None) == 7
               print("ACCM_CAPTURE_SELFTEST_PASS")
           
           def seal(source, target):
@@ -404,7 +419,7 @@ jobs:
               mkdir -p "$HOME" "$CARGO_HOME"
               printf "%s\n" "[source.crates-io]" "replace-with = \"vendored-sources\"" "[source.vendored-sources]" "directory = \"/vendor\"" "[net]" "offline = true" > "$CARGO_HOME/config.toml"
               echo ACCM_LINUX_FEATURE_GRAPH_BEGIN
-              cargo tree --frozen --target x86_64-unknown-linux-gnu --edges normal,build,dev,features --prefix depth
+              cargo tree --frozen --target x86_64-unknown-linux-gnu --edges normal,build,dev,features --prefix depth --charset ascii
               echo ACCM_LINUX_FEATURE_GRAPH_END
               RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --frozen --target x86_64-unknown-linux-gnu
               cp /work/target/x86_64-unknown-linux-gnu/release/sm-action /work/candidate
@@ -441,6 +456,8 @@ jobs:
               if timeout 3 bash -c "echo > /dev/tcp/192.0.2.1/443" 2>/dev/null; then exit 13; fi
               mkdir -p "$HOME" "$CARGO_HOME"
               printf "%s\n" "[source.crates-io]" "replace-with = \"vendored-sources\"" "[source.vendored-sources]" "directory = \"/vendor\"" "[net]" "offline = true" > "$CARGO_HOME/config.toml"
+              test -f /candidate && test -x /candidate
+              if touch /candidate 2>/dev/null; then exit 11; fi
               RUSTFLAGS="-C target-feature=-crt-static" cargo test --release --frozen --target x86_64-unknown-linux-gnu
               test ! -e /work/probe-env && test ! -e /work/probe-output
               touch /work/probe-env /work/probe-output

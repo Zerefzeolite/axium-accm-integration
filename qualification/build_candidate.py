@@ -129,8 +129,22 @@ def main():
     binary = target_dir / TARGET / "release" / "sm-action"
     require(binary.is_file() and not binary.is_symlink(), "Build output missing")
     candidate_sha = digest(binary)
-    native_version = offline([binary, "--version"], capture=True)
-    require("3.0.1" in native_version.split(), "Unexpected native version")
+    # Upstream constructs its Actions runner before handling --version.
+    # Use only local empty command files, never the actual CI command channels.
+    command_env = root / "probe-env"
+    command_output = root / "probe-output"
+    command_env.touch(mode=0o600, exist_ok=False)
+    command_output.touch(mode=0o600, exist_ok=False)
+    env["GITHUB_ENV"] = str(command_env)
+    env["GITHUB_OUTPUT"] = str(command_output)
+    try:
+        native_version = offline([binary, "--version"], capture=True)
+    finally:
+        env.pop("GITHUB_ENV")
+        env.pop("GITHUB_OUTPUT")
+    require(native_version == "3.0.1", "Unexpected native version")
+    require(command_env.stat().st_size == 0 and command_output.stat().st_size == 0,
+            "Unexpected native probe command output")
     require(digest(binary) == candidate_sha, "Binary changed during version probe")
     require(not run([git, "status", "--porcelain", "--untracked-files=all"],
                     env, src, capture=True), "Upstream checkout changed")

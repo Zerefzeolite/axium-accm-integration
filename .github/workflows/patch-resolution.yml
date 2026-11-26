@@ -1,6 +1,11 @@
 name: ACCM dependency patch resolution
 on:
   workflow_dispatch:
+    inputs:
+      reviewed_merge_sha:
+        description: Independently reviewed protected merge commit
+        required: true
+        type: string
 permissions: {}
 concurrency:
   group: accm-public-source-qualification
@@ -9,10 +14,12 @@ jobs:
   resolve:
     if: github.repository == 'Zerefzeolite/axium-accm-integration' && github.repository_id == '1472823260' && github.actor_id == '9297681' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && github.run_number == 1
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - name: Resolve fixed public dependency versions without compiling
         shell: bash
+        env:
+          REVIEWED_MERGE_SHA: ${{ inputs.reviewed_merge_sha }}
         run: |
           set -euo pipefail
           umask 077
@@ -21,6 +28,8 @@ jobs:
           test "$GITHUB_REF_PROTECTED" = true
           test "$GITHUB_WORKFLOW_REF" = 'Zerefzeolite/axium-accm-integration/.github/workflows/patch-resolution.yml@refs/heads/main'
           test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          [[ "$REVIEWED_MERGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_SHA" = "$REVIEWED_MERGE_SHA"
           root="$(mktemp -d)"
           tag="accm-patch-resolver:$GITHUB_RUN_ID"
           release_name="accm-resolve-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
@@ -268,90 +277,269 @@ jobs:
                   sys.exit(result if 0 <= result <= 255 else 1)
           CAPTURE_PY
           clean /usr/bin/python3 "$root/capture.py" --selftest
-          mkdir -m 700 "$root/patch"
-          cp -a "$root/src/." "$root/patch/"
-          # Resolver only: Cargo update does not run build scripts or compile crates.
-          # Preserve the original source and use a dedicated writable candidate copy.
-          clean /usr/bin/python3 "$root/capture.py" "$root/resolve.log" "$release_name" /usr/bin/docker run "${common[@]}" --name "$release_name" --log-driver none --network bridge \
+          cat > "$root/registry.py" <<'REGISTRY_PY'
+          import base64, concurrent.futures, hashlib, ipaddress, json, os, re, socket, stat, subprocess, sys, tomllib
+          from pathlib import Path
+          TARGETS = {"rustls":"0.23.46","rustls-webpki":"0.103.16","h2":"0.4.16","url":"2.5.9","crypto-bigint":"0.7.6","ctutils":"0.4.4","crossbeam-epoch":"0.9.20"}
+          SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+          ROOT = ("sm-action","3.0.1")
+          OLD_SHA = "cf301ce7de2e66b03cfbe7174b7a91e058f367a3c0bdf5cf5a4bbb52ba92445a"
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+          def canonical(obj):
+              return (json.dumps(obj,sort_keys=True,separators=(",",":"))+"\n").encode()
+          def identity(n,v):
+              assert isinstance(n,str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}",n)
+              assert isinstance(v,str) and re.fullmatch(r"[0-9][A-Za-z0-9.+-]{0,95}",v)
+              return n,v
+          def parse(data):
+              doc=tomllib.loads(data.decode("utf-8"))
+              assert set(doc)=={"version","package"} and doc["version"]==4
+              packages={}
+              for p in doc["package"]:
+                  assert set(p)<= {"name","version","source","checksum","dependencies"}
+                  k=identity(p["name"],p["version"])
+                  assert k not in packages
+                  if k==ROOT:
+                      assert "source" not in p and "checksum" not in p
+                  else:
+                      assert k[0]!=ROOT[0] and p["source"]==SOURCE
+                      assert re.fullmatch(r"[0-9a-f]{64}",p["checksum"])
+                  packages[k]=p
+              assert ROOT in packages
+              byname={}
+              for k in packages:
+                  byname.setdefault(k[0],[]).append(k)
+              edges=set()
+              for k,p in packages.items():
+                  deps=p.get("dependencies",[])
+                  assert isinstance(deps,list) and len(deps)==len(set(deps))
+                  for d in deps:
+                      assert isinstance(d,str)
+                      parts=d.split(" ")
+                      assert len(parts) in (1,2)
+                      if len(parts)==1:
+                          found=byname.get(parts[0],[])
+                          assert len(found)==1
+                          dest=found[0]
+                      else:
+                          dest=identity(*parts)
+                          assert dest in packages
+                      edges.add((k,dest))
+              reached={ROOT}
+              while True:
+                  more={b for a,b in edges if a in reached}
+                  if more<=reached: break
+                  reached |= more
+              assert reached==set(packages),"Unreachable lock entry"
+              return packages,edges
+          def old_lock():
+              data=Path("src/Cargo.lock").read_bytes()
+              assert sha(data)==OLD_SHA
+              pk,edges=parse(data)
+              assert len(pk)==388
+              return pk,edges
+          def index_path(n):
+              n=n.lower()
+              if len(n)==1: return "1/"+n
+              if len(n)==2: return "2/"+n
+              if len(n)==3: return "3/"+n[0]+"/"+n
+              return n[:2]+"/"+n[2:4]+"/"+n
+          def public_ip(host):
+              ips=sorted({x[4][0] for x in socket.getaddrinfo(host,443,socket.AF_INET,socket.SOCK_STREAM)})
+              assert ips and all(ipaddress.ip_address(x).is_global for x in ips)
+              return ips[0]
+          def acquire():
+              pk,_=old_lock()
+              allowed={k:p["checksum"] for k,p in pk.items() if k!=ROOT}
+              for n,v in TARGETS.items():
+                  assert any(k[0]==n for k in allowed)
+                  allowed.setdefault((n,v),None)
+              assert len(allowed)==394
+              hosts={h:public_ip(h) for h in ("index.crates.io","static.crates.io")}
+              reg=Path("registry")
+              (reg/"index").mkdir()
+              def get(host,path,limit):
+                  assert host in hosts and re.fullmatch(r"[A-Za-z0-9_./+-]+",path)
+                  assert ".." not in path.split("/") and not path.startswith("/")
+                  result=subprocess.run(["/usr/bin/curl","--disable","--fail","--silent","--show-error",
+                      "--proto","=https","--noproxy","*","--proxy","","--ipv4",
+                      "--resolve",host+":443:"+hosts[host],"--connect-timeout","15",
+                      "--max-time","90","--max-filesize",str(limit),
+                      "--write-out","%{http_code}","--output",str(reg/"download"/path.replace("/","_")),
+                      "https://"+host+"/"+path],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,check=True,timeout=95)
+                  assert result.stdout==b"200","Non-200 or redirect refused"
+                  p=reg/"download"/path.replace("/","_")
+                  assert 0<p.stat().st_size<=limit
+                  data=p.read_bytes()
+                  p.unlink()
+                  return data
+              (reg/"download").mkdir()
+              names=sorted({k[0] for k in allowed})
+              def index(n):
+                  path=index_path(n)
+                  raw=get("index.crates.io",path,8*1024*1024)
+                  chosen={}
+                  for line in raw.splitlines():
+                      row=json.loads(line)
+                      k=identity(row["name"],row["vers"])
+                      assert k[0]==n
+                      if k in allowed:
+                          assert k not in chosen and re.fullmatch(r"[a-f0-9]{64}",row["cksum"])
+                          assert isinstance(row["yanked"],bool)
+                          assert allowed[k] is None or allowed[k]==row["cksum"]
+                          if allowed[k] is None: assert not row["yanked"],"Target yanked"
+                          chosen[k]=row
+                  assert set(chosen)=={k for k in allowed if k[0]==n},"Missing exact version"
+                  out=reg/"index"/path
+                  out.parent.mkdir(parents=True,exist_ok=True)
+                  out.write_bytes(b"".join(canonical(chosen[k]) for k in sorted(chosen)))
+                  return {k:r["cksum"] for k,r in chosen.items()}
+              checks={}
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                  for part in ex.map(index,names): checks.update(part)
+              assert set(checks)==set(allowed)
+              total=0
+              def archive(k):
+                  n,v=k
+                  file=n+"-"+v+".crate"
+                  raw=get("static.crates.io","crates/"+n+"/"+file,32*1024*1024)
+                  assert sha(raw)==checks[k],"Crate checksum mismatch"
+                  (reg/file).write_bytes(raw)
+                  return len(raw)
+              # At most eight in-flight files above the checked aggregate ceiling.
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                  for i in range(0,len(checks),8):
+                      batch=sorted(checks)[i:i+8]
+                      total+=sum(ex.map(archive,batch))
+                      assert total<=768*1024*1024,"Registry byte ceiling"
+              (reg/"download").rmdir()
+              inventory={p.relative_to(reg).as_posix():sha(p.read_bytes()) for p in sorted(reg.rglob("*")) if p.is_file()}
+              Path("registry-inventory.json").write_bytes(canonical(inventory))
+              Path("allowed-checksums.json").write_bytes(canonical([{"name":n,"version":v,"sha256":checks[n,v]} for n,v in sorted(checks)]))
+              print("ACCM_REGISTRY_ARCHIVES="+str(len(checks)))
+              print("ACCM_REGISTRY_BYTES="+str(total))
+              print("ACCM_REGISTRY_INVENTORY_SHA256="+sha(Path("registry-inventory.json").read_bytes()))
+          def read_output():
+              # The resolver only sees /out, not the parent. Anchor each directory and leaf.
+              flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW
+              rootfd=os.open(".",flags)
+              try:
+                  outfd=os.open("out",flags,dir_fd=rootfd)
+                  try:
+                      assert os.listdir(outfd)==["Cargo.lock"],"Unexpected resolver output"
+                      fd=os.open("Cargo.lock",os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=outfd)
+                      with os.fdopen(fd,"rb") as f:
+                          s=os.fstat(f.fileno())
+                          assert stat.S_ISREG(s.st_mode) and s.st_nlink==1 and 0<s.st_size<=512*1024
+                          data=f.read(512*1024+1)
+                          assert len(data)==s.st_size
+                          return data
+                  finally: os.close(outfd)
+              finally: os.close(rootfd)
+          def validate():
+              before,oldedges=old_lock()
+              data=read_output()
+              after,newedges=parse(data)
+              checks={(x["name"],x["version"]):x["sha256"] for x in json.loads(Path("allowed-checksums.json").read_bytes())}
+              for k,p in after.items():
+                  if k!=ROOT: assert checks[k]==p["checksum"]
+              for n,v in TARGETS.items():
+                  assert {x for a,x in after if a==n}=={v}
+              def sdk(pkgs):
+                  return {k:v.get("checksum") for k,v in pkgs.items() if k[0]=="bitwarden" or k[0].startswith("bitwarden-")}
+              assert sdk(before)==sdk(after)
+              for k in before.keys() & after.keys():
+                  assert before[k].get("checksum")==after[k].get("checksum")
+              removed=sorted(before.keys()-after.keys())
+              added=sorted(after.keys()-before.keys())
+              assert len(removed)+len(added)<=80
+              assert len(oldedges^newedges)<=1024
+              for k in removed: print("LOCK_REMOVED "+" ".join(k))
+              for k in added: print("LOCK_ADDED "+" ".join(k))
+              for a,b in sorted(oldedges-newedges): print("EDGE_REMOVED "+" ".join(a)+" -> "+" ".join(b))
+              for a,b in sorted(newedges-oldedges): print("EDGE_ADDED "+" ".join(a)+" -> "+" ".join(b))
+              Path("sealed/Cargo.lock").write_bytes(data)
+              Path("lock-digest").write_text(sha(data))
+              print("ACCM_PATCH_LOCK_SCHEMA_AND_EDGES_PASS")
+          def emit():
+              data=Path("sealed/Cargo.lock").read_bytes()
+              assert sha(data)==Path("lock-digest").read_text()
+              print("ACCM_PATCH_LOCK_SHA256="+sha(data))
+              print("ACCM_PATCH_LOCK_BASE64_BEGIN")
+              encoded=base64.b64encode(data).decode("ascii")
+              for i in range(0,len(encoded),4096): print(encoded[i:i+4096])
+              print("ACCM_PATCH_LOCK_BASE64_END")
+              print("ACCM_PATCH_RESOLUTION_PASS_NOT_ADMITTED")
+          if __name__=="__main__":
+              {"acquire":acquire,"validate":validate,"emit":emit}[sys.argv[1]]()
+          REGISTRY_PY
+          # Host-side fixed public data acquisition only; no Cargo network access.
+          # Each baseline and exact target crate is pinned against its index checksum.
+          clean /usr/bin/python3 "$root/registry.py" acquire
+          mkdir -m 700 "$root/out" "$root/sealed"
+          cp -a "$root/src/." "$root/sealed/"
+          # Cargo local-registry, restricted to original versions plus seven targets.
+          # No host directory is writable except the dedicated single-file output.
+          clean /usr/bin/python3 "$root/capture.py" "$root/resolve.log" "$release_name" /usr/bin/docker run "${common[@]}" "${offline[@]}" --name "$release_name" --log-driver none \
+            --tmpfs "/patch:rw,nosuid,nodev,size=16m,mode=0700,uid=$uid,gid=$gid" \
+            --tmpfs "/cargo-home:rw,nosuid,nodev,noexec,size=3g,mode=0700,uid=$uid,gid=$gid" \
             --mount "type=bind,source=$root/tool,target=/toolchain,readonly" \
-            --mount "type=bind,source=$root/patch,target=/patch" \
-            --mount "type=bind,source=$root/registry,target=/cargo-home" \
+            --mount "type=bind,source=$root/src/Cargo.toml,target=/patch/Cargo.toml,readonly" \
+            --mount "type=bind,source=$root/src/src,target=/patch/src,readonly" \
+            --mount "type=bind,source=$root/src/Cargo.lock,target=/baseline.lock,readonly" \
+            --mount "type=bind,source=$root/registry,target=/registry,readonly" \
+            --mount "type=bind,source=$root/out,target=/out" \
             --env HOME=/tmp --env CARGO_HOME=/cargo-home --env RUSTC=/toolchain/bin/rustc \
-            --env CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse --env CARGO_NET_RETRY=1 --env CARGO_HTTP_TIMEOUT=30 \
-            --env PATH=/toolchain/bin:/usr/bin:/bin \
+            --env CARGO_NET_OFFLINE=true --env PATH=/toolchain/bin:/usr/bin:/bin \
             --workdir /patch --entrypoint /bin/bash "$builder" --noprofile --norc -euc '
               set -o pipefail
-              test "$(id -u)" -ne 0
+              test "$(id -u)" = "$EXPECTED_UID" && test "$(id -u)" -ne 0
+              test "$(readlink /proc/self/ns/net)" != "$HOST_NETNS"
+              test "$(ls -1 /sys/class/net)" = lo
+              test "$(wc -l < /proc/net/route)" -eq 1
               grep -Eq "^CapEff:[[:space:]]+0+$" /proc/self/status
               grep -Eq "^CapBnd:[[:space:]]+0+$" /proc/self/status
               grep -Eq "^NoNewPrivs:[[:space:]]+1$" /proc/self/status
               grep -Eq "^Seccomp:[[:space:]]+2$" /proc/self/status
               test ! -S /var/run/docker.sock
-              cargo update -p rustls --precise 0.23.46
-              cargo update -p rustls-webpki --precise 0.103.16
-              cargo update -p h2 --precise 0.4.16
-              cargo update -p url --precise 2.5.9
-              cargo update -p crypto-bigint --precise 0.7.6
-              cargo update -p ctutils --precise 0.4.4
-              cargo update -p crossbeam-epoch --precise 0.9.20
-              cargo metadata --locked --format-version 1 --no-deps > /tmp/metadata.json
+              for path in /patch/Cargo.toml /baseline.lock /patch/src/.write-probe /registry/.write-probe /toolchain/.write-probe; do
+                if touch "$path" 2>/dev/null; then exit 11; fi
+              done
+              cp /baseline.lock Cargo.lock
+              printf "%s\n" "[source.crates-io]" "replace-with = \"local-snapshot\"" "[source.local-snapshot]" "local-registry = \"/registry\"" "[net]" "offline = true" > "$CARGO_HOME/config.toml"
+              cargo update --offline -p rustls --precise 0.23.46
+              cargo update --offline -p rustls-webpki --precise 0.103.16
+              cargo update --offline -p h2 --precise 0.4.16
+              cargo update --offline -p url --precise 2.5.9
+              cargo update --offline -p crypto-bigint --precise 0.7.6
+              cargo update --offline -p ctutils --precise 0.4.4
+              cargo update --offline -p crossbeam-epoch --precise 0.9.20
+              cp Cargo.lock /out/Cargo.lock
             '
-          # No executable crosses the container boundary. Only bounded lock metadata.
-          clean /usr/bin/python3 - <<'PY'
-          import base64, hashlib, json, os, pathlib, re, stat, tomllib
-          from pathlib import Path
-          def read_regular(p, limit):
-              fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-              with os.fdopen(fd, "rb") as f:
-                  s = os.fstat(f.fileno())
-                  assert stat.S_ISREG(s.st_mode) and s.st_nlink == 1 and s.st_size <= limit
-                  data = f.read(limit + 1)
-                  assert len(data) == s.st_size
-                  return data
-          for name in ("Cargo.toml", "LICENSE", "src/main.rs", "src/config.rs", "src/ci.rs"):
-              assert read_regular("patch/" + name, 1024*1024) == Path("src/" + name).read_bytes(), "Non-lock source changed"
-          old = Path("src/Cargo.lock").read_bytes()
-          new = read_regular("patch/Cargo.lock", 512*1024)
-          assert hashlib.sha256(old).hexdigest() == "cf301ce7de2e66b03cfbe7174b7a91e058f367a3c0bdf5cf5a4bbb52ba92445a"
-          def parse(data):
-              pkgs = tomllib.loads(data.decode())["package"]
-              result = {}
-              for p in pkgs:
-                  key = (p["name"], p["version"])
-                  assert re.fullmatch(r"[A-Za-z0-9_-]{1,128}", key[0])
-                  assert re.fullmatch(r"[0-9][A-Za-z0-9.+-]{0,95}", key[1])
-                  assert key not in result
-                  if p["name"] == "sm-action":
-                      assert p["version"] == "3.0.1" and "source" not in p
-                  else:
-                      assert p["source"] == "registry+https://github.com/rust-lang/crates.io-index"
-                      assert re.fullmatch(r"[a-f0-9]{64}", p["checksum"])
-                  result[key] = p
-              return result
-          before, after = parse(old), parse(new)
-          targets = {"rustls":"0.23.46","rustls-webpki":"0.103.16","h2":"0.4.16","url":"2.5.9","crypto-bigint":"0.7.6","ctutils":"0.4.4","crossbeam-epoch":"0.9.20"}
-          for name, ver in targets.items():
-              assert {v for n,v in after if n == name} == {ver}, "Exact patch target missing"
-          # SDK package versions and registry checksums must not change.
-          def sdk(pkgs):
-              return {k: v.get("checksum") for k,v in pkgs.items() if k[0] == "bitwarden" or k[0].startswith("bitwarden-")}
-          assert sdk(before) == sdk(after)
-          for key in before.keys() & after.keys():
-              assert before[key].get("checksum") == after[key].get("checksum")
-          removed = sorted(before.keys() - after.keys())
-          added = sorted(after.keys() - before.keys())
-          assert len(removed) + len(added) <= 80, "Unexpected broad resolver change"
-          print("ACCM_PATCH_OLD_PACKAGE_COUNT=" + str(len(before)))
-          print("ACCM_PATCH_NEW_PACKAGE_COUNT=" + str(len(after)))
-          for n,v in removed:
-              print("LOCK_REMOVED " + n + " " + v)
-          for n,v in added:
-              print("LOCK_ADDED " + n + " " + v)
-          print("ACCM_PATCH_LOCK_SHA256=" + hashlib.sha256(new).hexdigest())
-          print("ACCM_PATCH_LOCK_BASE64_BEGIN")
-          encoded = base64.b64encode(new).decode("ascii")
-          for i in range(0, len(encoded), 4096):
-              print(encoded[i:i+4096])
-          print("ACCM_PATCH_LOCK_BASE64_END")
-          print("ACCM_PATCH_RESOLUTION_PASS_NOT_ADMITTED")
-          PY
+          clean /usr/bin/python3 "$root/registry.py" validate
+          # Fresh offline verifier receives only the host-sealed exact lock and original source.
+          clean /usr/bin/python3 "$root/capture.py" "$root/validate.log" "$test_name" /usr/bin/docker run "${common[@]}" "${offline[@]}" --name "$test_name" --log-driver none \
+            --tmpfs "/cargo-home:rw,nosuid,nodev,noexec,size=3g,mode=0700,uid=$uid,gid=$gid" \
+            --mount "type=bind,source=$root/tool,target=/toolchain,readonly" \
+            --mount "type=bind,source=$root/sealed,target=/patch,readonly" \
+            --mount "type=bind,source=$root/registry,target=/registry,readonly" \
+            --env HOME=/tmp --env CARGO_HOME=/cargo-home --env RUSTC=/toolchain/bin/rustc \
+            --env CARGO_NET_OFFLINE=true --env PATH=/toolchain/bin:/usr/bin:/bin \
+            --workdir /patch --entrypoint /bin/bash "$builder" --noprofile --norc -euc '
+              test "$(id -u)" = "$EXPECTED_UID" && test "$(id -u)" -ne 0
+              test "$(readlink /proc/self/ns/net)" != "$HOST_NETNS"
+              test "$(ls -1 /sys/class/net)" = lo
+              test "$(wc -l < /proc/net/route)" -eq 1
+              grep -Eq "^CapEff:[[:space:]]+0+$" /proc/self/status
+              grep -Eq "^CapBnd:[[:space:]]+0+$" /proc/self/status
+              grep -Eq "^NoNewPrivs:[[:space:]]+1$" /proc/self/status
+              grep -Eq "^Seccomp:[[:space:]]+2$" /proc/self/status
+              test ! -S /var/run/docker.sock
+              if touch /patch/Cargo.lock 2>/dev/null; then exit 11; fi
+              printf "%s\n" "[source.crates-io]" "replace-with = \"local-snapshot\"" "[source.local-snapshot]" "local-registry = \"/registry\"" "[net]" "offline = true" > "$CARGO_HOME/config.toml"
+              cargo metadata --frozen --format-version 1 > /tmp/metadata.json
+              test -s /tmp/metadata.json
+            '
+          echo ACCM_FULL_LOCKED_METADATA_PASS
+          clean /usr/bin/python3 "$root/registry.py" emit
